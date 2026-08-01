@@ -69,3 +69,12 @@ docker compose up -d
 3. 拉取/构建新镜像，滚动前保持单实例。
 4. 检查 `/health/live`、`/health/ready`、登录和只读测试连接。
 5. 应用回滚可恢复旧镜像；如果迁移不可向后兼容，必须恢复升级前数据库与 keys，不要盲目执行 `database update` 到旧版本。
+# Explicit database migration
+
+Production Compose does not apply schema migrations automatically. Before starting a new Web image, back up PostgreSQL and run the migration as an explicit deployment step:
+
+```bash
+dotnet ef database update --project src/CommandHub.Infrastructure --startup-project src/CommandHub.Infrastructure
+```
+
+The `HardenCancellationAndLongCommands` migration converts full command fields to PostgreSQL `text`, removes the unsafe full-command B-tree index, adds the indexed SHA-256 normalized-command hash and prefix, backfills existing rows, and adds durable cancellation-request metadata. It requires permission to install the PostgreSQL `pgcrypto` extension.

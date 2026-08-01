@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
-COPY CommandHub.sln Directory.Build.props global.json ./
+COPY CommandHub.sln Directory.Build.props global.json .editorconfig ./
 COPY src/CommandHub.Domain/CommandHub.Domain.csproj src/CommandHub.Domain/
 COPY src/CommandHub.Application/CommandHub.Application.csproj src/CommandHub.Application/
 COPY src/CommandHub.Infrastructure/CommandHub.Infrastructure.csproj src/CommandHub.Infrastructure/
