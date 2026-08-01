@@ -1,0 +1,52 @@
+@page "/servers"
+@inject ICommandHubService Service
+@inject AuthenticationStateProvider AuthenticationStateProvider
+
+<PageTitle>服务器 - CommandHub</PageTitle>
+<div class="page-heading"><div><p class="eyebrow">SSH 目标与信任</p><h1>服务器</h1><p>凭据采用 Data Protection 加密；首次连接必须人工确认主机密钥。</p></div><AuthorizeView Roles="SystemAdministrator"><button class="btn btn-primary" @onclick="NewServer">添加服务器</button></AuthorizeView></div>
+@if (!string.IsNullOrEmpty(message)) { <div class="alert @messageClass">@message</div> }
+<section class="panel"><div class="table-responsive"><table class="table command-table"><thead><tr><th>名称</th><th>主机</th><th>环境</th><th>状态</th><th>主机密钥</th><th></th></tr></thead><tbody>
+@foreach (var server in servers)
+{
+    <tr><td><strong>@server.Name</strong><div class="small text-secondary">@server.Username</div></td><td><code>@server.Host:@server.Port</code></td><td>@server.Environment</td><td>@(server.IsEnabled ? "已启用" : "已禁用")<div class="small text-secondary">@server.LastConnectionStatus</div></td><td>@(server.HasTrustedHostKey ? "已固定" : "待确认")</td><td class="text-end"><button class="btn btn-sm btn-outline-info" @onclick="() => Test(server.Id)">测试</button> <AuthorizeView Roles="SystemAdministrator"><button class="btn btn-sm btn-outline-light" @onclick="() => Edit(server.Id)">编辑</button> <button class="btn btn-sm btn-outline-warning" @onclick="() => Toggle(server)">@(server.IsEnabled ? "禁用" : "启用")</button> <button class="btn btn-sm btn-outline-danger" @onclick="()=>BeginDelete(server)">删除</button></AuthorizeView></td></tr>
+}
+
+@if (hostKeyToRetrust is not null)
+{
+    <section class="panel security-warning mt-4"><h2>主机密钥已变化</h2><p>连接已被拒绝。只有在确认这是预期密钥轮换后才能重新信任；请显示核对旧、新指纹，并重新验证管理员身份。</p><dl><dt>旧指纹</dt><dd><code>@trustedFingerprint</code></dd><dt>新算法</dt><dd><code>@hostKeyToRetrust.Algorithm</code></dd><dt>新指纹</dt><dd><code>@hostKeyToRetrust.Fingerprint</code></dd></dl><label>输入服务器名称<InputText class="form-control" @bind-Value="reTrustServerName" /></label><label class="d-block mt-2">当前管理员密码<InputText type="password" class="form-control" @bind-Value="reTrustPassword" /></label><button class="btn btn-danger mt-3" @onclick="ReTrustHostKey">重新验证并覆盖主机密钥</button></section>
+}
+
+@if (deleteCandidate is not null)
+{
+    <section class="panel security-warning mt-4"><h2>删除或禁用服务器</h2><p>输入 <strong>@deleteCandidate.Name</strong> 确认。有执行历史时系统只会禁用服务器，以保留审计完整性。</p><InputText class="form-control" @bind-Value="deleteConfirmation" /><button class="btn btn-danger mt-3" disabled="@(!string.Equals(deleteConfirmation,deleteCandidate.Name,StringComparison.Ordinal))" @onclick="ConfirmDelete">确认</button> <button class="btn btn-outline-light mt-3" @onclick="()=>deleteCandidate=null">取消</button></section>
+}
+</tbody></table></div>@if(servers.Count==0){<div class="empty-state">尚未添加服务器。</div>}</section>
+
+@if (hostKeyToTrust is not null)
+{
+    <section class="panel security-warning mt-4"><h2>确认 SSH 主机密钥</h2><p>请通过可信渠道在服务器上核对下列信息。确认后，后续任何变更都会导致连接被拒绝。</p><dl><dt>算法</dt><dd><code>@hostKeyToTrust.Algorithm</code></dd><dt>SHA-256 指纹</dt><dd><code>@hostKeyToTrust.Fingerprint</code></dd></dl><AuthorizeView Roles="SystemAdministrator"><button class="btn btn-danger" @onclick="TrustHostKey">我已通过可信渠道核对并固定此密钥</button></AuthorizeView></section>
+}
+
+@if (showEditor)
+{
+    <section class="panel mt-4"><h2>@(editor.Id is null ? "添加服务器" : "编辑服务器")</h2><EditForm Model="editor" OnValidSubmit="Save"><DataAnnotationsValidator /><ValidationSummary />
+        <div class="form-grid"><label>名称<InputText class="form-control" @bind-Value="editor.Name" /></label><label>环境<InputSelect class="form-select" @bind-Value="editor.Environment">@foreach(var value in Enum.GetValues<ServerEnvironment>()){<option value="@value">@value</option>}</InputSelect></label><label>Host<InputText class="form-control" @bind-Value="editor.Host" /></label><label>端口<InputNumber class="form-control" @bind-Value="editor.Port" /></label><label>SSH 用户名<InputText class="form-control" @bind-Value="editor.DefaultUsername" /></label><label>默认工作目录<InputText class="form-control" @bind-Value="editor.DefaultWorkingDirectory" /></label><label>凭据类型<InputSelect class="form-select" @bind-Value="editor.CredentialType"><option value="PrivateKey">私钥（推荐）</option><option value="Password">密码</option></InputSelect></label></div>
+        @if(editor.CredentialType==CredentialType.PrivateKey){<label class="d-block mt-3">私钥（编辑时留空表示不修改）<InputTextArea class="form-control secret-area" @bind-Value="editor.PrivateKey" /></label><label class="d-block mt-3">私钥密码<InputText type="password" class="form-control" @bind-Value="editor.PrivateKeyPassphrase" /></label>}else{<label class="d-block mt-3">密码（编辑时留空表示不修改）<InputText type="password" class="form-control" @bind-Value="editor.Password" /></label>}
+        <label class="form-check mt-3"><InputCheckbox class="form-check-input" @bind-Value="editor.IsEnabled" /> 启用</label><div class="mt-3"><button class="btn btn-primary" type="submit">保存</button> <button class="btn btn-outline-light" type="button" @onclick="()=>showEditor=false">取消</button></div>
+    </EditForm></section>
+}
+
+@code {
+    private IReadOnlyList<ServerListItem> servers=[]; private ServerEditorModel editor=new(); private bool showEditor; private string? message; private string messageClass="alert-info"; private HostKeyInfo? hostKeyToTrust; private HostKeyInfo? hostKeyToRetrust; private string? trustedFingerprint; private string reTrustServerName=string.Empty; private string reTrustPassword=string.Empty; private Guid testedServerId; private string userId=string.Empty; private bool isAdmin; private ServerListItem? deleteCandidate; private string deleteConfirmation=string.Empty;
+    protected override async Task OnInitializedAsync(){var user=(await AuthenticationStateProvider.GetAuthenticationStateAsync()).User;userId=user.FindFirstValue(ClaimTypes.NameIdentifier)!;isAdmin=user.IsInRole(SystemRoles.SystemAdministrator);await Reload();}
+    private Task Reload()=>LoadServers(); private async Task LoadServers()=>servers=await Service.GetServersAsync(userId,isAdmin);
+    private void NewServer(){editor=new();showEditor=true;hostKeyToTrust=null;}
+    private async Task Edit(Guid id){editor=await Service.GetServerForEditAsync(id)??new();showEditor=true;}
+    private async Task Save(){try{var id=await Service.SaveServerAsync(editor,userId);showEditor=false;await Reload();message="服务器已保存。建议立即测试连接并确认主机密钥。";messageClass="alert-success";await Test(id);}catch(Exception ex){message=ex.Message;messageClass="alert-danger";}}
+    private async Task Toggle(ServerListItem item){await Service.SetServerEnabledAsync(item.Id,!item.IsEnabled,userId);await Reload();}
+    private async Task Test(Guid id){testedServerId=id;hostKeyToTrust=null;hostKeyToRetrust=null;var result=await Service.TestConnectionAsync(id,userId);if(result.RequiresHostKeyTrust){hostKeyToTrust=result.HostKey;message="首次连接需要确认主机密钥。";messageClass="alert-warning";}else if(result.HostKeyChanged){hostKeyToRetrust=result.HostKey;trustedFingerprint=result.TrustedFingerprint;message="SSH 主机密钥发生变化，连接已拒绝。";messageClass="alert-danger";}else{message=result.Success?$"连接成功：{result.OperatingSystem} / {result.Hostname} / {result.Username}（{result.LatencyMilliseconds} ms）":result.Error;messageClass=result.Success?"alert-success":"alert-danger";}await Reload();}
+    private async Task TrustHostKey(){if(hostKeyToTrust is null)return;await Service.TrustHostKeyAsync(testedServerId,hostKeyToTrust,userId);message="主机密钥已固定。正在重新测试连接…";messageClass="alert-success";hostKeyToTrust=null;await Test(testedServerId);}
+    private async Task ReTrustHostKey(){if(hostKeyToRetrust is null)return;try{await Service.ReTrustHostKeyAsync(testedServerId,hostKeyToRetrust,reTrustServerName,reTrustPassword,userId);message="主机密钥已通过重新验证流程更新。";messageClass="alert-success";hostKeyToRetrust=null;reTrustPassword=string.Empty;await Test(testedServerId);}catch(Exception ex){message=ex.Message;messageClass="alert-danger";}}
+    private void BeginDelete(ServerListItem server){deleteCandidate=server;deleteConfirmation=string.Empty;}
+    private async Task ConfirmDelete(){if(deleteCandidate is null||!string.Equals(deleteConfirmation,deleteCandidate.Name,StringComparison.Ordinal))return;await Service.DeleteServerAsync(deleteCandidate.Id,userId);deleteCandidate=null;deleteConfirmation=string.Empty;await Reload();message="服务器删除流程已完成。";messageClass="alert-success";}
+}

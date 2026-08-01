@@ -1,0 +1,21 @@
+@page "/administration"
+@attribute [Authorize(Roles = "SystemAdministrator")]
+@inject IAdministrationService AdministrationService
+@inject ICommandHubService CommandHubService
+@inject AuthenticationStateProvider AuthenticationStateProvider
+
+<PageTitle>系统管理 - CommandHub</PageTitle>
+<div class="page-heading"><div><p class="eyebrow">账户与最小权限</p><h1>系统管理</h1><p>公共注册已关闭。管理员在此创建账户，并按服务器授予查看、执行和高风险权限。</p></div></div>
+@if(!string.IsNullOrEmpty(message)){<div class="alert @(failed?"alert-danger":"alert-success")">@message</div>}
+<div class="admin-grid"><section class="panel"><h2>用户</h2><div class="table-responsive"><table class="table command-table"><thead><tr><th>账户</th><th>角色</th><th>状态</th><th></th></tr></thead><tbody>@foreach(var user in users){<tr><td>@user.DisplayName<div class="small text-secondary">@user.Email</div></td><td>@string.Join(", ",user.Roles)</td><td>@(user.IsEnabled?"启用":"禁用")</td><td><button class="btn btn-sm btn-outline-warning" @onclick="()=>ToggleUser(user)">@(user.IsEnabled?"禁用":"启用")</button></td></tr>}</tbody></table></div></section>
+<section class="panel"><h2>创建用户</h2><EditForm Model="newUser" OnValidSubmit="CreateUser"><label>邮箱<InputText class="form-control" @bind-Value="newUser.Email" /></label><label class="d-block mt-3">显示名称<InputText class="form-control" @bind-Value="newUser.DisplayName" /></label><label class="d-block mt-3">初始密码<InputText type="password" class="form-control" @bind-Value="newUser.Password" /></label><label class="d-block mt-3">角色<InputSelect class="form-select" @bind-Value="newUser.Role">@foreach(var role in SystemRoles.All){<option value="@role">@role</option>}</InputSelect></label><button class="btn btn-primary mt-3">创建</button></EditForm></section></div>
+<section class="panel mt-4"><h2>服务器授权</h2><EditForm Model="permission" OnValidSubmit="SavePermission"><div class="form-grid"><label>用户<InputSelect class="form-select" @bind-Value="permission.UserId"><option value="">请选择</option>@foreach(var user in users){<option value="@user.Id">@user.Email</option>}</InputSelect></label><label>服务器<InputSelect class="form-select" @bind-Value="permission.ServerId"><option value="@Guid.Empty">请选择</option>@foreach(var server in servers){<option value="@server.Id">@server.Name</option>}</InputSelect></label><label>权限级别<InputSelect class="form-select" @bind-Value="permission.PermissionLevel">@foreach(var level in Enum.GetValues<PermissionLevel>()){<option value="@level">@level</option>}</InputSelect></label></div><div class="permission-checks mt-3"><label><InputCheckbox @bind-Value="permission.CanViewHistory" /> 查看历史</label><label><InputCheckbox @bind-Value="permission.CanExecuteCommands" /> 执行命令</label><label><InputCheckbox @bind-Value="permission.CanExecuteHighRiskCommands" /> 高风险命令</label><label><InputCheckbox @bind-Value="permission.CanManageTemplates" /> 管理模板</label></div><button class="btn btn-primary mt-3">保存授权</button></EditForm></section>
+
+@code {
+    private IReadOnlyList<UserListItem> users=[];private IReadOnlyList<ServerListItem> servers=[];private CreateUserModel newUser=new();private PermissionEditorModel permission=new();private string actorId=string.Empty;private string? message;private bool failed;
+    protected override async Task OnInitializedAsync(){var user=(await AuthenticationStateProvider.GetAuthenticationStateAsync()).User;actorId=user.FindFirstValue(ClaimTypes.NameIdentifier)!;await Reload();}
+    private async Task Reload(){users=await AdministrationService.GetUsersAsync();servers=await CommandHubService.GetServersAsync(actorId,true);}
+    private async Task CreateUser(){try{await AdministrationService.CreateUserAsync(newUser,actorId);newUser=new();message="用户已创建。";failed=false;await Reload();}catch(Exception ex){message=ex.Message;failed=true;}}
+    private async Task ToggleUser(UserListItem user){await AdministrationService.SetUserEnabledAsync(user.Id,!user.IsEnabled,actorId);await Reload();}
+    private async Task SavePermission(){try{await AdministrationService.SetPermissionAsync(permission,actorId);message="授权已保存。";failed=false;}catch(Exception ex){message=ex.Message;failed=true;}}
+}

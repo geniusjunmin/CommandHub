@@ -1,0 +1,35 @@
+@page "/"
+@inject ICommandHubService Service
+@inject AuthenticationStateProvider AuthenticationStateProvider
+
+<PageTitle>概览 - CommandHub</PageTitle>
+<div class="page-heading"><div><p class="eyebrow">安全的 Linux 运维工作台</p><h1>概览</h1><p>连接服务器、执行经过风险检查的命令，并保留可搜索的审计历史。</p></div><AuthorizeView Roles="SystemAdministrator,Operator"><a class="btn btn-primary" href="execute">执行命令</a></AuthorizeView></div>
+@if (loading) { <p>正在加载…</p> }
+else
+{
+    <div class="metric-grid">
+        <article class="metric-card"><span>可访问服务器</span><strong>@servers.Count</strong><small>@servers.Count(x => x.IsEnabled) 台已启用</small></article>
+        <article class="metric-card"><span>最近执行</span><strong>@history.Count</strong><small>最近 10 条记录</small></article>
+        <article class="metric-card"><span>成功率</span><strong>@SuccessRate</strong><small>基于当前列表</small></article>
+        <article class="metric-card"><span>待处理</span><strong>@history.Count(x => x.Status is ExecutionStatus.Pending or ExecutionStatus.Queued or ExecutionStatus.Running)</strong><small>排队或运行中</small></article>
+    </div>
+    <section class="panel mt-4"><div class="panel-title"><h2>最近执行</h2><a href="history">查看全部</a></div>
+        @if (history.Count == 0) { <div class="empty-state">还没有执行记录。添加服务器并运行第一条命令。</div> }
+        else { <div class="table-responsive"><table class="table command-table"><thead><tr><th>命令</th><th>服务器</th><th>状态</th><th>时间</th></tr></thead><tbody>@foreach(var item in history){<tr><td><a href="execution/@item.Id"><code>@item.MaskedCommand</code></a></td><td>@item.ServerName</td><td><StatusBadge Status="item.Status" /></td><td>@item.CreatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm")</td></tr>}</tbody></table></div> }
+    </section>
+}
+
+@code {
+    private bool loading = true;
+    private IReadOnlyList<ServerListItem> servers = [];
+    private IReadOnlyList<ExecutionListItem> history = [];
+    private string SuccessRate => history.Count == 0 ? "—" : $"{history.Count(x => x.Status == ExecutionStatus.Succeeded) * 100 / history.Count}%";
+    protected override async Task OnInitializedAsync()
+    {
+        var user = (await AuthenticationStateProvider.GetAuthenticationStateAsync()).User;
+        var id = user.FindFirstValue(ClaimTypes.NameIdentifier)!;
+        servers = await Service.GetServersAsync(id, user.IsInRole(SystemRoles.SystemAdministrator));
+        history = (await Service.SearchHistoryAsync(new HistoryQuery { PageSize = 10 }, id, user.IsInRole(SystemRoles.SystemAdministrator) || user.IsInRole(SystemRoles.Auditor))).Items;
+        loading = false;
+    }
+}

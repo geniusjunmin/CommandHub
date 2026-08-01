@@ -1,0 +1,8 @@
+@page "/audit"
+@attribute [Authorize(Roles = "SystemAdministrator,Auditor")]
+@inject ICommandHubService Service
+
+<PageTitle>审计日志 - CommandHub</PageTitle>
+<div class="page-heading"><div><p class="eyebrow">只读安全事件</p><h1>审计日志</h1><p>重要管理、凭据、主机密钥和执行操作均记录为不可由普通用户修改的事件。</p></div><a class="btn btn-outline-primary" href="/api/audit.csv">导出 CSV</a></div>
+<section class="panel"><div class="table-responsive"><table class="table command-table"><thead><tr><th>时间</th><th>操作</th><th>资源</th><th>说明</th><th>用户</th><th>关联 ID</th></tr></thead><tbody>@foreach(var item in logs){<tr><td>@item.CreatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td><td><code>@item.Action</code></td><td>@item.ResourceType<div class="small text-secondary">@item.ResourceId</div></td><td>@item.Description</td><td>@item.UserId</td><td><code>@item.CorrelationId</code></td></tr>}</tbody></table></div>@if(logs.Count==0){<div class="empty-state">暂无审计事件。</div>}</section>
+@code { private IReadOnlyList<AuditLog> logs=[]; protected override async Task OnInitializedAsync()=>logs=await Service.GetAuditLogsAsync(1,100); }

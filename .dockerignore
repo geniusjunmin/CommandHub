@@ -1,0 +1,10 @@
+**/bin
+**/obj
+.git
+.vs
+.tools
+.keys
+.env
+TestResults
+artifacts
+需求.txt

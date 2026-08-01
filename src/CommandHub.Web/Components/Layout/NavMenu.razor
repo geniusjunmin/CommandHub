@@ -1,0 +1,30 @@
+@implements IDisposable
+@inject NavigationManager NavigationManager
+
+<div class="top-row ps-3 navbar navbar-dark"><div class="container-fluid"><a class="navbar-brand" href="">CommandHub</a></div></div>
+<input type="checkbox" title="导航菜单" class="navbar-toggler" />
+<div class="nav-scrollable" onclick="document.querySelector('.navbar-toggler').click()">
+    <nav class="nav flex-column">
+        <AuthorizeView>
+            <Authorized Context="navAuth">
+                <NavItem Url="" Text="概览" Icon="bi-house-door-fill-nav-menu" Match="NavLinkMatch.All" />
+                <NavItem Url="servers" Text="服务器" Icon="bi-hdd-network-nav-menu" />
+                <AuthorizeView Roles="SystemAdministrator,Operator"><NavItem Url="execute" Text="执行命令" Icon="bi-terminal-nav-menu" /></AuthorizeView>
+                <NavItem Url="history" Text="历史记录" Icon="bi-clock-history-nav-menu" />
+                <NavItem Url="templates" Text="命令模板" Icon="bi-file-earmark-code-nav-menu" />
+                <AuthorizeView Roles="SystemAdministrator,Auditor"><NavItem Url="audit" Text="审计日志" Icon="bi-shield-check-nav-menu" /></AuthorizeView>
+                <AuthorizeView Roles="SystemAdministrator"><NavItem Url="administration" Text="系统管理" Icon="bi-gear-fill-nav-menu" /></AuthorizeView>
+                <div class="nav-item px-3"><NavLink class="nav-link" href="Account/Manage"><span class="bi bi-person-fill-nav-menu"></span> @navAuth.User.Identity?.Name</NavLink></div>
+                <div class="nav-item px-3"><form action="Account/Logout" method="post"><AntiforgeryToken /><input type="hidden" name="ReturnUrl" value="@currentUrl" /><button type="submit" class="nav-link"><span class="bi bi-arrow-bar-left-nav-menu"></span> 退出</button></form></div>
+            </Authorized>
+            <NotAuthorized><div class="nav-item px-3"><NavLink class="nav-link" href="Account/Login"><span class="bi bi-person-badge-nav-menu"></span> 登录</NavLink></div></NotAuthorized>
+        </AuthorizeView>
+    </nav>
+</div>
+
+@code {
+    private string? currentUrl;
+    protected override void OnInitialized() { currentUrl = NavigationManager.ToBaseRelativePath(NavigationManager.Uri); NavigationManager.LocationChanged += OnLocationChanged; }
+    private void OnLocationChanged(object? sender, LocationChangedEventArgs e) { currentUrl = NavigationManager.ToBaseRelativePath(e.Location); StateHasChanged(); }
+    public void Dispose() => NavigationManager.LocationChanged -= OnLocationChanged;
+}

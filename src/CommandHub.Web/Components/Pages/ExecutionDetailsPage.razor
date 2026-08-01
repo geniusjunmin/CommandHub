@@ -1,0 +1,129 @@
+@page "/execution/{ExecutionId:guid}"
+@implements IAsyncDisposable
+@inject ICommandHubService Service
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject IJSRuntime JS
+
+<PageTitle>执行详情 - CommandHub</PageTitle>
+@if (details is null)
+{
+    <div class="empty-state">执行不存在或无权查看。</div>
+}
+else
+{
+    <div class="page-heading">
+        <div><p class="eyebrow">执行 @ExecutionId</p><h1>执行详情</h1><p><code>@details.Execution.MaskedCommandText</code></p></div>
+        <div><StatusBadge Status="details.Execution.Status" /> <a class="btn btn-sm btn-outline-light" href="/api/executions/@ExecutionId/output">下载输出</a></div>
+    </div>
+    <div class="execution-meta"><span>服务器 <strong>@details.Execution.Server.Name</strong></span><span>目录 <code>@details.Execution.WorkingDirectory</code></span><span>风险 <strong>@details.Execution.RiskLevel</strong></span><span>Exit <strong>@details.Execution.ExitCode</strong></span><span>耗时 <strong>@details.Execution.DurationMilliseconds ms</strong></span></div>
+    <div class="tag-row mb-3">@foreach(var tag in details.Tags){<button class="tag-chip" title="删除标签" @onclick="()=>RemoveTag(tag)">@tag ×</button>}<InputText class="form-control form-control-sm tag-input" @bind-Value="newTag" placeholder="添加标签" /><button class="btn btn-sm btn-outline-light" @onclick="AddTag">添加</button></div>
+    <section class="terminal-panel">
+        <div class="terminal-toolbar"><span>实时输出 <small class="text-secondary">@connectionLabel</small></span><div><button class="btn btn-sm btn-outline-light" @onclick="()=>autoRefresh=!autoRefresh">断线刷新：@(autoRefresh?"开":"关")</button> @if(details.Execution.Status is ExecutionStatus.Running or ExecutionStatus.Queued){<AuthorizeView Roles="SystemAdministrator,Operator"><button class="btn btn-sm btn-outline-danger" @onclick="Cancel">取消</button></AuthorizeView>}</div></div>
+        <pre class="terminal-output">@foreach(var chunk in output){<span class="stream-@chunk.StreamType.ToString().ToLowerInvariant()">@chunk.Content</span>}</pre>
+        @if(details.Execution.OutputTruncated){<div class="alert alert-warning">输出已达到保存上限，数据库仅保留截断前内容。</div>}
+    </section>
+}
+
+@code {
+    [Parameter] public Guid ExecutionId { get; set; }
+    private ExecutionDetails? details;
+    private readonly List<CommandOutputChunk> output = [];
+    private string userId = string.Empty;
+    private bool auditAll;
+    private bool autoRefresh = true;
+    private string connectionLabel = "正在连接 SignalR…";
+    private string newTag = string.Empty;
+    private CancellationTokenSource? refreshCts;
+    private IJSObjectReference? module;
+    private DotNetObjectReference<ExecutionDetailsPage>? selfReference;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var user = (await AuthenticationStateProvider.GetAuthenticationStateAsync()).User;
+        userId = user.FindFirstValue(ClaimTypes.NameIdentifier)!;
+        auditAll = user.IsInRole(SystemRoles.SystemAdministrator) || user.IsInRole(SystemRoles.Auditor);
+        await Load();
+        refreshCts = new();
+        _ = RefreshLoop(refreshCts.Token);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender || details is null) return;
+        try
+        {
+            module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/execution-stream.js");
+            selfReference = DotNetObjectReference.Create(this);
+            await module.InvokeVoidAsync("connect", ExecutionId.ToString(), selfReference);
+            connectionLabel = "SignalR 已连接";
+        }
+        catch
+        {
+            connectionLabel = "SignalR 断开，使用轮询";
+        }
+        await InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public Task OnOutputReceived(ExecutionOutput value)
+    {
+        if (output.All(chunk => chunk.Sequence != value.Sequence))
+            output.Add(new CommandOutputChunk { ExecutionId = value.ExecutionId, Sequence = value.Sequence, StreamType = value.StreamType, Content = value.Content, ByteLength = value.ByteLength });
+        return InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public Task OnStatusChanged(ExecutionStatus status)
+    {
+        if (details is not null) details.Execution.Status = status;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public async Task OnExecutionCompleted(ExecutionStatus status, int? exitCode)
+    {
+        if (details is not null) { details.Execution.Status = status; details.Execution.ExitCode = exitCode; }
+        await Load();
+    }
+
+    private async Task Load()
+    {
+        details = await Service.GetExecutionAsync(ExecutionId, userId, auditAll);
+        if (details is not null)
+        {
+            output.Clear();
+            output.AddRange(details.Output);
+        }
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task RefreshLoop(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                await Task.Delay(1000, token);
+                if (autoRefresh && details?.Execution.Status is ExecutionStatus.Running or ExecutionStatus.Queued) await Load();
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task Cancel() { await Service.CancelAsync(ExecutionId, userId, auditAll); await Load(); }
+    private async Task AddTag() { if (string.IsNullOrWhiteSpace(newTag)) return; await Service.AddTagAsync(ExecutionId, newTag, userId, auditAll); newTag = string.Empty; await Load(); }
+    private async Task RemoveTag(string tag) { await Service.RemoveTagAsync(ExecutionId, tag, userId, auditAll); await Load(); }
+
+    public async ValueTask DisposeAsync()
+    {
+        refreshCts?.Cancel();
+        refreshCts?.Dispose();
+        if (module is not null)
+        {
+            try { await module.InvokeVoidAsync("disconnect", ExecutionId.ToString()); }
+            catch (JSDisconnectedException) { }
+            await module.DisposeAsync();
+        }
+        selfReference?.Dispose();
+    }
+}

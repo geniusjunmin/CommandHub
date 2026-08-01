@@ -1,0 +1,16 @@
+@page "/history"
+@inject ICommandHubService Service
+@inject AuthenticationStateProvider AuthenticationStateProvider
+
+<PageTitle>历史记录 - CommandHub</PageTitle>
+<div class="page-heading"><div><p class="eyebrow">可搜索的操作记忆</p><h1>历史记录</h1><p>按命令、服务器、目录、状态和风险快速定位过去的操作。</p></div></div>
+<section class="panel"><EditForm Model="query" OnValidSubmit="Search"><div class="history-filters"><InputText class="form-control" @bind-Value="query.Search" placeholder="搜索命令、服务器、目录或输出摘要" /><InputSelect class="form-select" @bind-Value="query.Status"><option value="">全部状态</option>@foreach(var value in Enum.GetValues<ExecutionStatus>()){<option value="@value">@value</option>}</InputSelect><InputSelect class="form-select" @bind-Value="query.RiskLevel"><option value="">全部风险</option>@foreach(var value in Enum.GetValues<RiskLevel>()){<option value="@value">@value</option>}</InputSelect><label class="form-check"><InputCheckbox class="form-check-input" @bind-Value="query.FavoritesOnly" /> 仅收藏</label><button class="btn btn-primary">搜索</button></div></EditForm></section>
+<section class="panel mt-4">@if(loading){<p>正在加载…</p>}else if(result.Items.Count==0){<div class="empty-state">没有匹配的执行记录。</div>}else{<div class="table-responsive"><table class="table command-table"><thead><tr><th></th><th>命令</th><th>服务器 / 目录</th><th>状态</th><th>风险</th><th>执行时间</th><th></th></tr></thead><tbody>@foreach(var item in result.Items){<tr><td><button class="favorite-button @(item.IsFavorite?"active":"")" title="收藏" @onclick="()=>ToggleFavorite(item)">★</button></td><td><a href="execution/@item.Id"><code>@item.MaskedCommand</code></a></td><td>@item.ServerName<div class="small text-secondary">@item.WorkingDirectory</div></td><td><StatusBadge Status="item.Status" /><div class="small text-secondary">Exit @item.ExitCode</div></td><td><span class="risk-label risk-@item.RiskLevel.ToString().ToLowerInvariant()">@item.RiskLevel</span></td><td>@item.CreatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td><td><a class="btn btn-sm btn-outline-light" href="execute?command=@Uri.EscapeDataString(item.MaskedCommand)">修改后运行</a></td></tr>}</tbody></table></div><div class="pagination-row"><span>共 @result.TotalCount 条 · 第 @result.Page 页</span><button class="btn btn-sm btn-outline-light" disabled="@(query.Page<=1)" @onclick="Previous">上一页</button><button class="btn btn-sm btn-outline-light" disabled="@(query.Page*query.PageSize>=result.TotalCount)" @onclick="Next">下一页</button></div>}</section>
+
+@code {
+    private HistoryQuery query=new(); private PagedResult<ExecutionListItem> result=new([],0,1,25); private bool loading=true; private string userId=string.Empty; private bool auditAll;
+    protected override async Task OnInitializedAsync(){var user=(await AuthenticationStateProvider.GetAuthenticationStateAsync()).User;userId=user.FindFirstValue(ClaimTypes.NameIdentifier)!;auditAll=user.IsInRole(SystemRoles.SystemAdministrator)||user.IsInRole(SystemRoles.Auditor);await Search();}
+    private async Task Search(){loading=true;result=await Service.SearchHistoryAsync(query,userId,auditAll);loading=false;}
+    private async Task ToggleFavorite(ExecutionListItem item){await Service.ToggleFavoriteAsync(item.Id,userId);await Search();}
+    private async Task Previous(){query.Page--;await Search();} private async Task Next(){query.Page++;await Search();}
+}

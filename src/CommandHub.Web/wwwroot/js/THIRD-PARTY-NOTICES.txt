@@ -1,0 +1,3 @@
+Microsoft ASP.NET Core SignalR JavaScript Client 10.0.0
+Copyright .NET Foundation and contributors
+Licensed under the MIT License: https://github.com/dotnet/aspnetcore/blob/main/LICENSE.txt

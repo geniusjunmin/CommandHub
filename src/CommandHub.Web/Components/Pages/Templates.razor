@@ -1,0 +1,22 @@
+@page "/templates"
+@inject ICommandHubService Service
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject NavigationManager Navigation
+
+<PageTitle>命令模板 - CommandHub</PageTitle>
+<div class="page-heading"><div><p class="eyebrow">可复用的运维知识</p><h1>命令模板</h1><p>模板参数默认采用 POSIX Shell 参数转义，并且执行时仍会重新进行权限与风险检查。</p></div><AuthorizeView Roles="SystemAdministrator,Operator"><button class="btn btn-primary" @onclick="NewTemplate">新建模板</button></AuthorizeView></div>
+@if(!string.IsNullOrEmpty(message)){<div class="alert alert-info">@message</div>}
+<div class="card-grid">@foreach(var template in templates){<article class="template-card"><div><span class="risk-label risk-@template.RiskLevel.ToString().ToLowerInvariant()">@template.RiskLevel</span> <span class="small text-secondary">@(template.IsShared?"共享":"私有")</span></div><h2>@template.Name</h2><p>@template.Description</p><pre>@template.CommandText</pre><div><button class="btn btn-sm btn-primary" @onclick="()=>Use(template)">使用</button> @if(template.CreatedByUserId==userId||isAdmin){<button class="btn btn-sm btn-outline-light" @onclick="()=>Edit(template)">编辑</button> <button class="btn btn-sm btn-outline-danger" @onclick="()=>Delete(template)">删除</button>}</div></article>}</div>
+@if(templates.Count==0){<div class="empty-state">还没有可用模板。</div>}
+@if(showEditor){<section class="panel mt-4"><h2>@(editing.Id==Guid.Empty?"新建模板":"编辑模板")</h2><EditForm Model="editing" OnValidSubmit="Save"><label>名称<InputText class="form-control" @bind-Value="editing.Name" /></label><label class="d-block mt-3">描述<InputText class="form-control" @bind-Value="editing.Description" /></label><label class="d-block mt-3">命令<InputTextArea class="form-control command-editor" @bind-Value="editing.CommandText" /></label><label class="d-block mt-3">默认目录<InputText class="form-control" @bind-Value="editing.DefaultWorkingDirectory" /></label><label class="form-check mt-3"><InputCheckbox class="form-check-input" @bind-Value="editing.IsShared" /> 共享给授权用户</label><button class="btn btn-primary mt-3">保存</button></EditForm></section>}
+
+@code {
+    private IReadOnlyList<CommandTemplate> templates=[];private CommandTemplate editing=new();private bool showEditor;private string userId=string.Empty;private bool isAdmin;private string? message;
+    protected override async Task OnInitializedAsync(){var user=(await AuthenticationStateProvider.GetAuthenticationStateAsync()).User;userId=user.FindFirstValue(ClaimTypes.NameIdentifier)!;isAdmin=user.IsInRole(SystemRoles.SystemAdministrator);await Reload();}
+    private async Task Reload()=>templates=await Service.GetTemplatesAsync(userId);
+    private void NewTemplate(){editing=new CommandTemplate{DefaultWorkingDirectory="~",CreatedByUserId=userId};showEditor=true;}
+    private void Edit(CommandTemplate value){editing=value;showEditor=true;}
+    private async Task Save(){editing.RiskLevel=RiskLevel.Low;await Service.SaveTemplateAsync(editing,userId,isAdmin);showEditor=false;message="模板已保存。";await Reload();}
+    private async Task Delete(CommandTemplate template){await Service.DeleteTemplateAsync(template.Id,userId,isAdmin);message="模板已删除。";await Reload();}
+    private void Use(CommandTemplate template)=>Navigation.NavigateTo($"execute?command={Uri.EscapeDataString(template.CommandText)}");
+}

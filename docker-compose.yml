@@ -1,0 +1,99 @@
+name: commandhub
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: commandhub
+      POSTGRES_USER: commandhub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U commandhub -d commandhub"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  commandhub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__DefaultConnection: Host=postgres;Port=5432;Database=commandhub;Username=commandhub;Password=${POSTGRES_PASSWORD}
+      COMMANDHUB_ADMIN_EMAIL: ${COMMANDHUB_ADMIN_EMAIL:?Set COMMANDHUB_ADMIN_EMAIL in .env}
+      COMMANDHUB_ADMIN_PASSWORD: ${COMMANDHUB_ADMIN_PASSWORD:?Set COMMANDHUB_ADMIN_PASSWORD in .env}
+      DataProtection__KeysPath: /app/keys
+      Database__ApplyMigrationsOnStartup: "true"
+      Database__InitializeOnStartup: "true"
+      Security__AllowCriticalCommands: ${ALLOW_CRITICAL_COMMANDS:-false}
+      Execution__GlobalConcurrency: ${EXECUTION_GLOBAL_CONCURRENCY:-10}
+      Execution__PerServerConcurrency: ${EXECUTION_PER_SERVER_CONCURRENCY:-3}
+      Execution__PerUserConcurrency: ${EXECUTION_PER_USER_CONCURRENCY:-3}
+      Execution__QueueCapacity: ${EXECUTION_QUEUE_CAPACITY:-100}
+      Execution__DefaultTimeoutSeconds: ${EXECUTION_DEFAULT_TIMEOUT_SECONDS:-300}
+      Execution__MaximumTimeoutSeconds: ${EXECUTION_MAXIMUM_TIMEOUT_SECONDS:-3600}
+      Execution__MaximumOutputBytes: ${EXECUTION_MAXIMUM_OUTPUT_BYTES:-10485760}
+    volumes:
+      - data-protection-keys:/app/keys
+    expose: ["8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [backend]
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      commandhub:
+        condition: service_healthy
+    environment:
+      COMMANDHUB_HOST: ${COMMANDHUB_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [backend]
+
+  ssh-fixture:
+    image: lscr.io/linuxserver/openssh-server:latest
+    profiles: ["test"]
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: UTC
+      USER_NAME: commandhub
+      PASSWORD_ACCESS: "true"
+      USER_PASSWORD: ${SSH_FIXTURE_PASSWORD}
+      SUDO_ACCESS: "false"
+    ports:
+      - "127.0.0.1:2222:2222"
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks: [backend]
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  data-protection-keys:
+  caddy-data:
+  caddy-config:

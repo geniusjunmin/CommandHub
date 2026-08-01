@@ -1,0 +1,33 @@
+@page "/execute"
+@attribute [Authorize(Roles = "SystemAdministrator,Operator")]
+@inject ICommandHubService Service
+@inject ICommandRiskAnalyzer RiskAnalyzer
+@inject ICommandMaskingService MaskingService
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject NavigationManager Navigation
+
+<PageTitle>执行命令 - CommandHub</PageTitle>
+<div class="page-heading"><div><p class="eyebrow">非交互式安全执行</p><h1>执行命令</h1><p>每次运行使用独立 SSH 会话。CommandHub 会先完成权限、风险与主机密钥检查。</p></div></div>
+@if (!string.IsNullOrEmpty(error)){<div class="alert alert-danger">@error</div>}
+<div class="execute-layout"><section class="panel"><EditForm Model="submission" OnValidSubmit="ReviewOrSubmit"><DataAnnotationsValidator />
+    <label>服务器<InputSelect class="form-select" @bind-Value="submission.ServerId"><option value="@Guid.Empty">请选择…</option>@foreach(var server in servers.Where(x=>x.IsEnabled)){<option value="@server.Id">@server.Name · @server.Host</option>}</InputSelect></label>
+    <label class="d-block mt-3">工作目录<InputText class="form-control font-monospace" @bind-Value="submission.WorkingDirectory" placeholder="使用服务器默认目录" /></label>
+    <label class="d-block mt-3">命令<InputTextArea class="form-control command-editor" @bind-Value="submission.CommandText" @bind-Value:event="oninput" /></label>
+    <div class="form-grid mt-3"><label>超时（秒）<InputNumber class="form-control" @bind-Value="submission.TimeoutSeconds" /></label><label class="form-check align-self-end"><InputCheckbox class="form-check-input" @bind-Value="submission.DoNotSaveCommand" /> 本次不保存命令内容</label></div>
+    @if (analysis is not null && analysis.Level >= RiskLevel.Medium)
+    {
+        <div class="risk-panel risk-@analysis.Level.ToString().ToLowerInvariant() mt-3"><strong>@analysis.Level 风险</strong><ul>@foreach(var reason in analysis.Reasons){<li>@reason</li>}</ul><label class="form-check"><InputCheckbox class="form-check-input" @bind-Value="submission.Confirmed" /> 我已阅读并确认此次风险</label>
+        @if(analysis.Level>=RiskLevel.High){<label class="d-block mt-2">输入服务器名称确认<InputText class="form-control" @bind-Value="submission.ConfirmationServerName" /></label>}
+        @if(analysis.Level==RiskLevel.Critical){<label class="d-block mt-2">输入固定确认短语<InputText class="form-control" @bind-Value="submission.CriticalConfirmationPhrase" /></label>}
+        </div>
+    }
+    <button class="btn btn-primary mt-3" type="submit" disabled="@submitting">@(submitting?"正在提交…":analysis is null?"分析风险":"确认并执行")</button>
+</EditForm></section>
+<aside class="panel execution-guide"><h2>提交前检查</h2><ol><li>服务端再次验证账户和服务器授权</li><li>敏感内容脱敏，Critical 默认拒绝</li><li>命令编码到临时脚本，不拼接进外层 SSH 命令</li><li>stdout / stderr 分块保存并实时推送</li></ol>@if(!string.IsNullOrWhiteSpace(submission.CommandText)){<h3>脱敏预览</h3><pre>@MaskingService.Mask(submission.CommandText)</pre>}</aside></div>
+
+@code {
+    private CommandSubmission submission=new(){TimeoutSeconds=300}; private IReadOnlyList<ServerListItem> servers=[]; private RiskAnalysis? analysis; private string? error; private string userId=string.Empty; private bool isAdmin; private bool submitting;
+    [SupplyParameterFromQuery(Name="command")] public string? CommandFromQuery {get;set;}
+    protected override async Task OnInitializedAsync(){var user=(await AuthenticationStateProvider.GetAuthenticationStateAsync()).User;userId=user.FindFirstValue(ClaimTypes.NameIdentifier)!;isAdmin=user.IsInRole(SystemRoles.SystemAdministrator);servers=await Service.GetServersAsync(userId,isAdmin);if(!string.IsNullOrEmpty(CommandFromQuery))submission.CommandText=CommandFromQuery;}
+    private async Task ReviewOrSubmit(){error=null;if(submission.ServerId==Guid.Empty){error="请选择服务器。";return;}analysis=RiskAnalyzer.Analyze(submission.CommandText);if(analysis.Level>=RiskLevel.Medium&&!submission.Confirmed)return;submitting=true;try{var result=await Service.SubmitAsync(submission,userId,isAdmin,null,null);if(result.Accepted&&result.ExecutionId is{} id)Navigation.NavigateTo($"execution/{id}");else error=result.Error;}finally{submitting=false;}}
+}

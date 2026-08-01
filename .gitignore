@@ -1,0 +1,17 @@
+bin/
+obj/
+.vs/
+.idea/
+.vscode/
+.tools/
+.keys/
+*.user
+*.suo
+*.db
+.env
+artifacts/
+TestResults/
+coverage/
+
+# Local product brief; the public project documentation lives under docs/.
+/需求.txt
