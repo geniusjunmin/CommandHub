@@ -17,7 +17,7 @@ public sealed class ExecutionWorkerService(
     IDbContextFactory<CommandHubDbContext> dbFactory,
     IExecutionNotifier notifier,
     ICommandClassificationService classifier,
-    ExecutionCancellationRegistry cancellationRegistry,
+    ILiveExecutionRegistry liveRegistry,
     IOptions<ExecutionOptions> options,
     ILogger<ExecutionWorkerService> logger) : BackgroundService
 {
@@ -59,12 +59,14 @@ public sealed class ExecutionWorkerService(
 
     private async Task ProcessAsync(ExecutionQueueItem item, CancellationToken stoppingToken)
     {
-        var cancellationToken = cancellationRegistry.Register(item.ExecutionId, stoppingToken);
+        var claimed = await ClaimQueuedExecutionAsync(item.ExecutionId, stoppingToken);
+        if (!claimed) return;
+        var handle = liveRegistry.Register(item.ExecutionId, item.ServerId, provider.ProviderName, stoppingToken);
+        var cancellationToken = handle.CancellationTokenSource.Token;
         try
         {
-            await UpdateStatusAsync(item.ExecutionId, ExecutionStatus.Running, cancellationToken);
             await notifier.ExecutionStartedAsync(item.ExecutionId, cancellationToken);
-            using var sink = new DatabaseOutputSink(item.ExecutionId, dbFactory, notifier, _options);
+            using var sink = new DatabaseOutputSink(item.ExecutionId, handle.ExecutionNonce, dbFactory, notifier, liveRegistry, _options);
             var result = await provider.StartAsync(item, sink, cancellationToken);
             var status = result.TimedOut ? ExecutionStatus.TimedOut : result.ExitCode == 0 ? ExecutionStatus.Succeeded : ExecutionStatus.Failed;
             await CompleteAsync(item.ExecutionId, status, result.ExitCode, result.TimedOut, false, result.RemoteProcessId, CancellationToken.None);
@@ -88,18 +90,21 @@ public sealed class ExecutionWorkerService(
             await CompleteAsync(item.ExecutionId, ExecutionStatus.Failed, null, false, false, null, CancellationToken.None);
             await notifier.ExecutionCompletedAsync(item.ExecutionId, ExecutionStatus.Failed, null, CancellationToken.None);
         }
-        finally { cancellationRegistry.Remove(item.ExecutionId); }
+        finally { liveRegistry.Remove(item.ExecutionId, handle.ExecutionNonce); }
     }
 
-    private async Task UpdateStatusAsync(Guid executionId, ExecutionStatus status, CancellationToken cancellationToken)
+    private async Task<bool> ClaimQueuedExecutionAsync(Guid executionId, CancellationToken cancellationToken)
     {
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
-        var execution = await db.CommandExecutions.SingleAsync(x => x.Id == executionId, cancellationToken);
-        execution.Status = status;
-        execution.StartedAt = DateTimeOffset.UtcNow;
-        execution.UpdatedAt = DateTimeOffset.UtcNow;
-        await db.SaveChangesAsync(cancellationToken);
-        await notifier.StatusChangedAsync(executionId, status, cancellationToken);
+        var now = DateTimeOffset.UtcNow;
+        var updated = await db.CommandExecutions
+            .Where(x => x.Id == executionId && x.Status == ExecutionStatus.Queued && x.CancellationRequestedAt == null)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, ExecutionStatus.Running)
+                .SetProperty(x => x.StartedAt, now)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken);
+        if (updated == 1) await notifier.StatusChangedAsync(executionId, ExecutionStatus.Running, cancellationToken);
+        return updated == 1;
     }
 
     private async Task CompleteAsync(Guid executionId, ExecutionStatus status, int? exitCode, bool timedOut, bool cancelled, long? processId, CancellationToken cancellationToken)
@@ -132,7 +137,7 @@ public sealed class ExecutionWorkerService(
     }
 }
 
-internal sealed class DatabaseOutputSink(Guid executionId, IDbContextFactory<CommandHubDbContext> dbFactory, IExecutionNotifier notifier, ExecutionOptions options) : IExecutionOutputSink, IDisposable
+internal sealed class DatabaseOutputSink(Guid executionId, Guid executionNonce, IDbContextFactory<CommandHubDbContext> dbFactory, IExecutionNotifier notifier, ILiveExecutionRegistry liveRegistry, ExecutionOptions options) : IExecutionOutputSink, IDisposable
 {
     private static readonly Regex Ansi = new(@"[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))", RegexOptions.Compiled, TimeSpan.FromMilliseconds(100));
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -150,6 +155,8 @@ internal sealed class DatabaseOutputSink(Guid executionId, IDbContextFactory<Com
     public async Task SetRemoteProcessIdAsync(long processId, CancellationToken cancellationToken)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(processId);
+        if (!liveRegistry.TrySetRemoteProcessGroupId(executionId, executionNonce, processId))
+            throw new InvalidOperationException("实时执行句柄已失效，拒绝登记远程进程组。");
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
         var execution = await db.CommandExecutions.SingleAsync(x => x.Id == executionId, cancellationToken);
         execution.RemoteProcessId = processId;

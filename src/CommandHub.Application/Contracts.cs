@@ -7,7 +7,7 @@ public sealed record ExecutionQueueItem(Guid ExecutionId, Guid ServerId, string 
 public sealed record ExecutionOutput(Guid ExecutionId, int Sequence, OutputStreamType StreamType, string Content, int ByteLength);
 public sealed record ExecutionStartResult(int ExitCode, bool TimedOut, long? RemoteProcessId);
 public sealed record CancelExecutionResult(bool Requested, bool RemoteTerminationConfirmed, string Message);
-public sealed record ExecutionHandle(Guid ExecutionId, Guid ServerId, long? RemoteProcessId);
+public sealed record LiveExecutionHandle(Guid ExecutionId, Guid ServerId, string ProviderName, long? RemoteProcessGroupId, CancellationTokenSource CancellationTokenSource, DateTimeOffset StartedAt, Guid ExecutionNonce);
 public sealed record HostKeyInfo(string Algorithm, string Fingerprint);
 public sealed record ConnectionTestResult(bool Success, bool RequiresHostKeyTrust, bool HostKeyChanged, HostKeyInfo HostKey, string? TrustedFingerprint, string? Hostname, string? OperatingSystem, string? Username, string? WorkingDirectory, long LatencyMilliseconds, string? Error);
 public sealed record SubmissionResult(bool Accepted, Guid? ExecutionId, RiskAnalysis Risk, string? Error);
@@ -85,6 +85,16 @@ public interface ICommandRiskAnalyzer { RiskAnalysis Analyze(string command); }
 public interface ICommandMaskingService { string Mask(string command); bool ContainsLikelySecret(string command); }
 public interface ICommandClassificationService { IReadOnlyList<string> Classify(string command); }
 public interface ITemplateRenderer { string Render(CommandTemplate commandTemplate, IReadOnlyDictionary<string, string?> values, bool allowRaw); }
+public interface IRemoteWorkingDirectoryResolver { string Resolve(string? workingDirectory, string serverDefaultWorkingDirectory); }
+
+public interface ILiveExecutionRegistry
+{
+    LiveExecutionHandle Register(Guid executionId, Guid serverId, string providerName, CancellationToken applicationToken);
+    bool TryGet(Guid executionId, out LiveExecutionHandle? handle);
+    bool TrySetRemoteProcessGroupId(Guid executionId, Guid nonce, long processGroupId);
+    bool RequestCancellation(Guid executionId);
+    bool Remove(Guid executionId, Guid nonce);
+}
 
 public interface IExecutionOutputSink
 {
@@ -104,7 +114,7 @@ public interface ICommandExecutionProvider
 {
     string ProviderName { get; }
     Task<ExecutionStartResult> StartAsync(ExecutionQueueItem request, IExecutionOutputSink outputSink, CancellationToken cancellationToken);
-    Task<CancelExecutionResult> CancelAsync(ExecutionHandle handle, CancellationToken cancellationToken);
+    Task<CancelExecutionResult> CancelAsync(LiveExecutionHandle handle, CancellationToken cancellationToken);
 }
 
 public interface IExecutionQueue

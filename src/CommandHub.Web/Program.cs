@@ -141,7 +141,14 @@ static void MapCommandHubApi(WebApplication app)
     api.MapPost("/executions/{id:guid}/cancel", async (Guid id, ClaimsPrincipal user, HttpContext http, IAntiforgery antiforgery, ICommandHubService service, CancellationToken ct) =>
     {
         await antiforgery.ValidateRequestAsync(http);
-        return Results.Ok(await service.CancelAsync(id, user.FindFirstValue(ClaimTypes.NameIdentifier)!, user.IsInRole(SystemRoles.SystemAdministrator), ct));
+        try
+        {
+            return Results.Ok(await service.CancelAsync(id, user.FindFirstValue(ClaimTypes.NameIdentifier)!, user.IsInRole(SystemRoles.SystemAdministrator), ct));
+        }
+        catch (CommandHub.Infrastructure.Services.ExecutionCancellationConflictException exception)
+        {
+            return Results.Conflict(new { error = exception.Message, status = exception.Status.ToString() });
+        }
     }).RequireAuthorization("Execute");
     api.MapGet("/executions/{id:guid}/output", async (Guid id, ClaimsPrincipal user, ICommandHubService service, CancellationToken ct) =>
     {

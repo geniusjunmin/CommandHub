@@ -19,7 +19,7 @@ public sealed class CommandHubService(
     IExecutionQueue queue,
     ICommandExecutionProvider executionProvider,
     SshCommandExecutionProvider sshProvider,
-    ExecutionCancellationRegistry cancellationRegistry,
+    ILiveExecutionRegistry liveRegistry,
     IOptions<ExecutionOptions> executionOptions,
     IOptions<SecurityOptions> securityOptions,
     UserManager<ApplicationUser> userManager) : ICommandHubService
@@ -195,7 +195,7 @@ public sealed class CommandHubService(
     {
         ArgumentNullException.ThrowIfNull(submission);
         if (string.IsNullOrWhiteSpace(submission.CommandText)) return new(false, null, new(RiskLevel.Low, []), "命令不能为空。");
-        if (submission.CommandText.Length > 65536) return new(false, null, new(RiskLevel.High, ["命令超过长度上限"]), "命令长度不能超过 65536 个字符。");
+        if (submission.CommandText.Length > DomainRules.MaximumCommandCharacters) return new(false, null, new(RiskLevel.High, ["命令超过长度上限"]), $"命令长度不能超过 {DomainRules.MaximumCommandCharacters} 个字符。");
 
         var risk = riskAnalyzer.Analyze(submission.CommandText);
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
@@ -225,6 +225,8 @@ public sealed class CommandHubService(
             CommandText = submission.DoNotSaveCommand || maskingService.ContainsLikelySecret(submission.CommandText) ? null : masked,
             MaskedCommandText = submission.DoNotSaveCommand ? "[本次命令内容未保存]" : masked,
             NormalizedCommand = submission.DoNotSaveCommand ? "[not-saved]" : normalized,
+            NormalizedCommandHash = DomainRules.ComputeCommandHash(submission.DoNotSaveCommand ? "[not-saved]" : normalized),
+            NormalizedCommandPrefix = (submission.DoNotSaveCommand ? "[not-saved]" : normalized)[..Math.Min(submission.DoNotSaveCommand ? 11 : normalized.Length, DomainRules.NormalizedCommandPrefixCharacters)],
             WorkingDirectory = string.IsNullOrWhiteSpace(submission.WorkingDirectory) ? server.DefaultWorkingDirectory : submission.WorkingDirectory.Trim(),
             RiskLevel = risk.Level,
             RiskReasons = JsonSerializer.Serialize(risk.Reasons),
@@ -256,8 +258,28 @@ public sealed class CommandHubService(
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
         var execution = await db.CommandExecutions.SingleOrDefaultAsync(x => x.Id == executionId, cancellationToken) ?? throw new KeyNotFoundException("执行记录不存在。");
         if (!isAdministrator && execution.UserId != userId) throw new UnauthorizedAccessException("无权取消此执行。");
-        var localRequested = cancellationRegistry.Cancel(executionId);
-        var remote = await executionProvider.CancelAsync(new(execution.Id, execution.ServerId, execution.RemoteProcessId), cancellationToken);
+        if (execution.Status is not (ExecutionStatus.Pending or ExecutionStatus.Queued or ExecutionStatus.Running))
+            throw new ExecutionCancellationConflictException(execution.Status);
+        execution.CancellationRequestedAt = DateTimeOffset.UtcNow;
+        execution.CancellationRequestedByUserId = userId;
+        execution.CancellationReason = "UserRequested";
+        if (execution.Status is ExecutionStatus.Pending or ExecutionStatus.Queued)
+        {
+            execution.Status = ExecutionStatus.Cancelled;
+            execution.WasCancelled = true;
+            execution.FinishedAt = DateTimeOffset.UtcNow;
+            AddAudit(db, userId, "CommandCancelled", "CommandExecution", executionId.ToString(), "排队中的执行已取消。", new { PreviousStatus = "Queued" }, correlationId: execution.CorrelationId);
+            await db.SaveChangesAsync(cancellationToken);
+            return new(true, false, "排队中的执行已取消，Worker 将跳过该任务。");
+        }
+        if (!liveRegistry.TryGet(executionId, out var handle) || handle is null)
+        {
+            AddAudit(db, userId, "CommandCancellationRequested", "CommandExecution", executionId.ToString(), "执行仍标记为 Running，但当前实例没有实时句柄；未使用历史 PID。", new { LiveHandle = false }, correlationId: execution.CorrelationId);
+            await db.SaveChangesAsync(cancellationToken);
+            return new(true, false, "当前实例没有实时执行句柄；为避免 PID/PGID 复用误杀，未发送远程信号。");
+        }
+        var localRequested = liveRegistry.RequestCancellation(executionId);
+        var remote = await executionProvider.CancelAsync(handle, cancellationToken);
         AddAudit(db, userId, "CommandCancellationRequested", "CommandExecution", executionId.ToString(), remote.Message, new { LocalCancellationRequested = localRequested, remote.RemoteTerminationConfirmed });
         await db.SaveChangesAsync(cancellationToken);
         return remote with { Requested = localRequested || remote.Requested };
@@ -320,6 +342,8 @@ public sealed class CommandHubService(
     public async Task ToggleFavoriteAsync(Guid executionId, string userId, CancellationToken cancellationToken = default)
     {
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
+        if (!await db.CommandExecutions.AnyAsync(x => x.Id == executionId && x.UserId == userId, cancellationToken))
+            throw new UnauthorizedAccessException("只能收藏自己的执行记录。");
         var favorite = await db.CommandFavorites.SingleOrDefaultAsync(x => x.ExecutionId == executionId && x.UserId == userId, cancellationToken);
         if (favorite is null) db.CommandFavorites.Add(new CommandFavorite { ExecutionId = executionId, UserId = userId }); else db.CommandFavorites.Remove(favorite);
         await db.SaveChangesAsync(cancellationToken);
@@ -355,6 +379,8 @@ public sealed class CommandHubService(
     public async Task<Guid> SaveTemplateAsync(CommandTemplate commandTemplate, string userId, bool isAdministrator, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(commandTemplate.Name) || string.IsNullOrWhiteSpace(commandTemplate.CommandText)) throw new DomainValidationException("模板名称和命令不能为空。");
+        DomainRules.ValidateCommandLength(commandTemplate.CommandText);
+        ValidateTemplateParameters(commandTemplate);
         if (!isAdministrator && commandTemplate.Parameters.Any(x => x.EscapeMode == TemplateEscapeMode.Raw)) throw new UnauthorizedAccessException("只有系统管理员可以保存 Raw 参数。");
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
         var existing = await db.CommandTemplates.Include(x => x.Parameters).SingleOrDefaultAsync(x => x.Id == commandTemplate.Id, cancellationToken);
@@ -375,6 +401,17 @@ public sealed class CommandHubService(
             existing.IsShared = commandTemplate.IsShared;
             existing.ServerId = commandTemplate.ServerId;
             existing.UpdatedAt = DateTimeOffset.UtcNow;
+            var incoming = commandTemplate.Parameters.ToDictionary(x => x.Id);
+            foreach (var removed in existing.Parameters.Where(x => !incoming.ContainsKey(x.Id)).ToList()) db.CommandTemplateParameters.Remove(removed);
+            foreach (var parameter in commandTemplate.Parameters)
+            {
+                var target = existing.Parameters.SingleOrDefault(x => x.Id == parameter.Id);
+                if (target is null) { target = new CommandTemplateParameter { Id = parameter.Id, Template = existing }; existing.Parameters.Add(target); }
+                target.Name = parameter.Name.Trim(); target.DisplayName = parameter.DisplayName.Trim(); target.Description = parameter.Description?.Trim();
+                target.DataType = parameter.DataType; target.EscapeMode = parameter.EscapeMode; target.IsRequired = parameter.IsRequired;
+                target.DefaultValue = parameter.IsSensitive ? null : parameter.DefaultValue; target.ValidationPattern = parameter.ValidationPattern;
+                target.AllowedValuesJson = parameter.AllowedValuesJson; target.IsSensitive = parameter.IsSensitive; target.SortOrder = parameter.SortOrder;
+            }
             commandTemplate = existing;
         }
         AddAudit(db, userId, "TemplateSaved", "CommandTemplate", commandTemplate.Id.ToString(), $"命令模板 {commandTemplate.Name} 已保存。", new { commandTemplate.Name, commandTemplate.IsShared });
@@ -411,9 +448,33 @@ public sealed class CommandHubService(
         return trimmed.ToUpperInvariant();
     }
 
+    private static void ValidateTemplateParameters(CommandTemplate commandTemplate)
+    {
+        var duplicate = commandTemplate.Parameters.GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase).FirstOrDefault(x => x.Count() > 1);
+        if (duplicate is not null) throw new DomainValidationException($"模板参数 {duplicate.Key} 重复。");
+        var placeholders = System.Text.RegularExpressions.Regex.Matches(commandTemplate.CommandText, @"{{\s*(?<name>[A-Za-z][A-Za-z0-9_]*)\s*}}", System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(200)).Select(x => x.Groups["name"].Value).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var definitions = commandTemplate.Parameters.Select(x => x.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var undefined = placeholders.Except(definitions).FirstOrDefault();
+        if (undefined is not null) throw new DomainValidationException($"占位符 {undefined} 没有参数定义。");
+        var unused = definitions.Except(placeholders).FirstOrDefault();
+        if (unused is not null) throw new DomainValidationException($"参数 {unused} 未在命令中使用。");
+        foreach (var parameter in commandTemplate.Parameters)
+        {
+            if (!System.Text.RegularExpressions.Regex.IsMatch(parameter.Name, @"^[A-Za-z][A-Za-z0-9_]*$", System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100))) throw new DomainValidationException("参数名称格式无效。");
+            if (parameter.IsSensitive) parameter.DefaultValue = null;
+            if (!string.IsNullOrWhiteSpace(parameter.ValidationPattern)) _ = new System.Text.RegularExpressions.Regex(parameter.ValidationPattern, System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(200));
+        }
+    }
+
     private static async Task EnsureCanViewExecutionAsync(CommandHubDbContext db, Guid executionId, string userId, bool canAuditAll, CancellationToken cancellationToken)
     {
         if (!canAuditAll && !await db.CommandExecutions.AnyAsync(x => x.Id == executionId && (x.UserId == userId || x.Server.Permissions.Any(p => p.UserId == userId && p.CanViewHistory)), cancellationToken))
             throw new UnauthorizedAccessException("无权修改此执行的标签。");
     }
+}
+
+public sealed class ExecutionCancellationConflictException(ExecutionStatus status)
+    : InvalidOperationException($"状态为 {status} 的执行不能取消。")
+{
+    public ExecutionStatus Status { get; } = status;
 }

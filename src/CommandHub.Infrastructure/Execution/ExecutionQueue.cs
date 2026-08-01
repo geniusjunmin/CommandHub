@@ -29,26 +29,42 @@ public sealed class ExecutionQueue : IExecutionQueue
     public void Complete() => _channel.Writer.TryComplete();
 }
 
-public sealed class ExecutionCancellationRegistry
+public sealed class LiveExecutionRegistry : ILiveExecutionRegistry
 {
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, CancellationTokenSource> _sources = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, LiveExecutionHandle> _handles = new();
 
-    public CancellationToken Register(Guid executionId, CancellationToken applicationToken)
+    public LiveExecutionHandle Register(Guid executionId, Guid serverId, string providerName, CancellationToken applicationToken)
     {
         var source = CancellationTokenSource.CreateLinkedTokenSource(applicationToken);
-        if (!_sources.TryAdd(executionId, source)) source.Dispose();
-        return _sources[executionId].Token;
+        var handle = new LiveExecutionHandle(executionId, serverId, providerName, null, source, DateTimeOffset.UtcNow, Guid.NewGuid());
+        if (!_handles.TryAdd(executionId, handle))
+        {
+            source.Dispose();
+            throw new InvalidOperationException("执行已在实时注册表中。");
+        }
+        return handle;
     }
 
-    public bool Cancel(Guid executionId)
+    public bool TryGet(Guid executionId, out LiveExecutionHandle? handle) => _handles.TryGetValue(executionId, out handle);
+
+    public bool TrySetRemoteProcessGroupId(Guid executionId, Guid nonce, long processGroupId)
     {
-        if (!_sources.TryGetValue(executionId, out var source)) return false;
-        source.Cancel();
+        if (processGroupId <= 0 || !_handles.TryGetValue(executionId, out var current) || current.ExecutionNonce != nonce) return false;
+        return _handles.TryUpdate(executionId, current with { RemoteProcessGroupId = processGroupId }, current);
+    }
+
+    public bool RequestCancellation(Guid executionId)
+    {
+        if (!_handles.TryGetValue(executionId, out var handle)) return false;
+        handle.CancellationTokenSource.Cancel();
         return true;
     }
 
-    public void Remove(Guid executionId)
+    public bool Remove(Guid executionId, Guid nonce)
     {
-        if (_sources.TryRemove(executionId, out var source)) source.Dispose();
+        if (!_handles.TryGetValue(executionId, out var current) || current.ExecutionNonce != nonce) return false;
+        if (!_handles.TryRemove(new KeyValuePair<Guid, LiveExecutionHandle>(executionId, current))) return false;
+        current.CancellationTokenSource.Dispose();
+        return true;
     }
 }

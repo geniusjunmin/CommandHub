@@ -58,6 +58,8 @@ public sealed class CommandExecution : Entity
     public string UserId { get; set; } = string.Empty;
     public string? CommandText { get; set; }
     public string NormalizedCommand { get; set; } = string.Empty;
+    public string NormalizedCommandHash { get; set; } = string.Empty;
+    public string NormalizedCommandPrefix { get; set; } = string.Empty;
     public string MaskedCommandText { get; set; } = string.Empty;
     public string WorkingDirectory { get; set; } = "~";
     public string Shell { get; set; } = "bash";
@@ -79,6 +81,9 @@ public sealed class CommandExecution : Entity
     public CommandSource Source { get; set; }
     public Guid CorrelationId { get; set; } = Guid.NewGuid();
     public long? RemoteProcessId { get; set; }
+    public DateTimeOffset? CancellationRequestedAt { get; set; }
+    public string? CancellationRequestedByUserId { get; set; }
+    public string? CancellationReason { get; set; }
     public ICollection<CommandOutputChunk> OutputChunks { get; set; } = [];
     public ICollection<CommandExecutionTag> ExecutionTags { get; set; } = [];
 }

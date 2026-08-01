@@ -37,5 +37,25 @@ public sealed class SecurityAndExecutionTests
         Assert.DoesNotContain(command, script, StringComparison.Ordinal);
         Assert.Contains(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(command)), script, StringComparison.Ordinal);
         Assert.Contains("'/srv/app'\"'\"'s data'", script, StringComparison.Ordinal);
+        Assert.Contains("setsid timeout", script, StringComparison.Ordinal);
+        Assert.Contains("ps -o pgid=", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("PID=$$", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LiveRegistry_NoncePreventsStaleHandleMutation()
+    {
+        var registry = new LiveExecutionRegistry();
+        var id = Guid.NewGuid();
+        var first = registry.Register(id, Guid.NewGuid(), "SSH", default);
+        Assert.True(registry.TrySetRemoteProcessGroupId(id, first.ExecutionNonce, 101));
+        Assert.True(registry.Remove(id, first.ExecutionNonce));
+        var second = registry.Register(id, Guid.NewGuid(), "SSH", default);
+        Assert.False(registry.TrySetRemoteProcessGroupId(id, first.ExecutionNonce, 202));
+        Assert.False(registry.Remove(id, first.ExecutionNonce));
+        Assert.True(registry.TryGet(id, out var current));
+        Assert.Equal(second.ExecutionNonce, current!.ExecutionNonce);
+        Assert.Null(current.RemoteProcessGroupId);
+        registry.Remove(id, second.ExecutionNonce);
     }
 }

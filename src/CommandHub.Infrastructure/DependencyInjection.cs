@@ -15,9 +15,10 @@ public static class DependencyInjection
         services.AddSingleton<ICommandMaskingService, CommandMaskingService>();
         services.AddSingleton<ICommandClassificationService, CommandClassificationService>();
         services.AddSingleton<ITemplateRenderer, TemplateRenderer>();
+        services.AddSingleton<IRemoteWorkingDirectoryResolver, RemoteWorkingDirectoryResolver>();
         services.AddSingleton<ICredentialProtector, CredentialProtector>();
         services.AddSingleton<IExecutionQueue, ExecutionQueue>();
-        services.AddSingleton<ExecutionCancellationRegistry>();
+        services.AddSingleton<ILiveExecutionRegistry, LiveExecutionRegistry>();
         services.AddSingleton<SshCommandExecutionProvider>();
         services.AddSingleton<ICommandExecutionProvider>(provider => provider.GetRequiredService<SshCommandExecutionProvider>());
         services.AddScoped<ICommandHubService, CommandHubService>();
