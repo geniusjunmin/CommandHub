@@ -25,6 +25,7 @@ public sealed class CancellationRaceIntegrationTests
             await setup.Database.MigrateAsync();
             setup.CommandExecutions.Add(CreateExecution(out var executionId, ExecutionStatus.Queued));
             await setup.SaveChangesAsync();
+            blocker.Enabled = true;
 
             var registry = new LiveExecutionRegistry();
             var handle = registry.Register(executionId, setup.CommandExecutions.Local.Single().ServerId, "fake", default);
@@ -114,12 +115,13 @@ public sealed class CancellationRaceIntegrationTests
 
     private sealed class CancellationUpdateBlocker : DbCommandInterceptor
     {
+        public bool Enabled { get; set; }
         public TaskCompletionSource UpdateReached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource ContinueUpdate { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public override async ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(DbCommand command, CommandEventData eventData,
             InterceptionResult<int> result, CancellationToken cancellationToken = default)
         {
-            if (command.CommandText.Contains("CancellationRequestedAt", StringComparison.Ordinal))
+            if (Enabled && command.CommandText.Contains("CancellationRequestedAt", StringComparison.Ordinal))
             {
                 UpdateReached.TrySetResult();
                 await ContinueUpdate.Task.WaitAsync(cancellationToken);
