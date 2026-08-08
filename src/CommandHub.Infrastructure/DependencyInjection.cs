@@ -25,6 +25,7 @@ public static class DependencyInjection
         services.AddScoped<IAdministrationService, AdministrationService>();
         services.AddScoped<ILoginAuditService, LoginAuditService>();
         services.AddScoped<DatabaseInitializer>();
+        services.AddHostedService<ExecutionRecoveryService>();
         services.AddHostedService<ExecutionWorkerService>();
         return services;
     }

@@ -1,5 +1,6 @@
 using CommandHub.Domain;
 using CommandHub.Infrastructure.Identity;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 
@@ -7,6 +8,8 @@ namespace CommandHub.Infrastructure.Persistence;
 
 public sealed class CommandHubDbContext(DbContextOptions<CommandHubDbContext> options) : IdentityDbContext<ApplicationUser>(options)
 {
+    protected override Version SchemaVersion => IdentitySchemaVersions.Version3;
+
     public DbSet<Server> Servers => Set<Server>();
     public DbSet<ServerCredential> ServerCredentials => Set<ServerCredential>();
     public DbSet<UserServerPermission> UserServerPermissions => Set<UserServerPermission>();

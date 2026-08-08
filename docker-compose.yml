@@ -32,6 +32,7 @@ services:
       COMMANDHUB_ADMIN_EMAIL: ${COMMANDHUB_ADMIN_EMAIL:?Set COMMANDHUB_ADMIN_EMAIL in .env}
       COMMANDHUB_ADMIN_PASSWORD: ${COMMANDHUB_ADMIN_PASSWORD:?Set COMMANDHUB_ADMIN_PASSWORD in .env}
       DataProtection__KeysPath: /app/keys
+      ReverseProxy__TrustedProxyHosts__0: caddy
       Database__ApplyMigrationsOnStartup: "false"
       Database__InitializeOnStartup: "true"
       Security__AllowCriticalCommands: ${ALLOW_CRITICAL_COMMANDS:-false}

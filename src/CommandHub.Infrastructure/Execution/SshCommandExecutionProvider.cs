@@ -17,10 +17,11 @@ namespace CommandHub.Infrastructure.Execution;
 public sealed class SshCommandExecutionProvider(
     IDbContextFactory<CommandHubDbContext> dbFactory,
     ICredentialProtector protector,
+    IRemoteWorkingDirectoryResolver workingDirectoryResolver,
     IOptions<ExecutionOptions> options,
     ILogger<SshCommandExecutionProvider> logger) : ICommandExecutionProvider
 {
-    private static readonly Regex ControlPid = new(@"^__COMMANDHUB_CONTROL__:PID=(?<pid>[1-9][0-9]*)$", RegexOptions.Compiled | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+    private static readonly Regex ControlPgid = new(@"^__COMMANDHUB_CONTROL__:PGID=(?<pgid>[1-9][0-9]*)$", RegexOptions.Compiled | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
     private readonly ExecutionOptions _options = options.Value;
     public string ProviderName => "SSH";
 
@@ -28,7 +29,7 @@ public sealed class SshCommandExecutionProvider(
     {
         var target = await LoadTargetAsync(request.ServerId, cancellationToken);
         var remotePath = $"/tmp/commandhub/{request.ExecutionId:N}.sh";
-        var script = BuildScript(request.CommandText, request.WorkingDirectory, request.TimeoutSeconds);
+        var script = BuildScript(request.CommandText, request.WorkingDirectory, request.TimeoutSeconds, workingDirectoryResolver);
 
         using var sftp = CreateSftpClient(target);
         using var ssh = CreateSshClient(target);
@@ -45,19 +46,20 @@ public sealed class SshCommandExecutionProvider(
             {
                 await Task.Run(() => sftp.UploadFile(content, remotePath, true), cancellationToken);
             }
-            sftp.ChangePermissions(remotePath, 448);
+            sftp.ChangePermissions(remotePath, 700);
 
             await Task.Run(ssh.Connect, cancellationToken);
             using var remoteCommand = ssh.CreateCommand($"bash /tmp/commandhub/{request.ExecutionId:N}.sh");
             remoteCommand.CommandTimeout = TimeSpan.FromSeconds(Math.Min(request.TimeoutSeconds + 15, _options.MaximumTimeoutSeconds + 15));
             var asyncResult = remoteCommand.BeginExecute();
 
-            long? processId = null;
+            long? processGroupId = null;
             var stdoutTask = PumpAsync(remoteCommand.OutputStream, OutputStreamType.StandardOutput, outputSink, null, cancellationToken);
-            var stderrTask = PumpAsync(remoteCommand.ExtendedOutputStream, OutputStreamType.StandardError, outputSink, async pid => { processId = pid; await outputSink.SetRemoteProcessIdAsync(pid, cancellationToken); }, cancellationToken);
+            var stderrTask = PumpAsync(remoteCommand.ExtendedOutputStream, OutputStreamType.StandardError, outputSink, async pgid => { processGroupId = pgid; await outputSink.SetRemoteProcessGroupIdAsync(pgid, cancellationToken); }, cancellationToken);
             await Task.WhenAll(stdoutTask, stderrTask);
             remoteCommand.EndExecute(asyncResult);
-            return new(remoteCommand.ExitStatus ?? -1, remoteCommand.ExitStatus == 124, processId);
+            cancellationToken.ThrowIfCancellationRequested();
+            return new(remoteCommand.ExitStatus ?? -1, remoteCommand.ExitStatus == 124, processGroupId);
         }
         finally
         {
@@ -72,23 +74,38 @@ public sealed class SshCommandExecutionProvider(
         }
     }
 
-    public async Task<CancelExecutionResult> CancelAsync(LiveExecutionHandle handle, CancellationToken cancellationToken)
+    public async Task<CancelExecutionResult> CancelAsync(ILiveExecutionCancellationLease lease, CancellationToken cancellationToken)
     {
-        if (handle.RemoteProcessGroupId is not > 0) return new(true, false, "尚未取得实时远程进程组 ID；已请求取消本地执行，远程终止状态无法确认。");
-        var target = await LoadTargetAsync(handle.ServerId, cancellationToken);
+        if (!lease.IsValid) return new(false, false, "实时执行 Lease 已失效；未发送远程信号。");
+        if (lease.RemoteProcessGroupId is not > 0) return new(true, false, "尚未取得实时远程进程组 ID；已请求取消本地执行，远程终止状态无法确认。");
+        var target = await LoadTargetAsync(lease.ServerId, cancellationToken);
         using var ssh = CreateSshClient(target);
         await Task.Run(ssh.Connect, cancellationToken);
-        var pid = handle.RemoteProcessGroupId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        using (var terminate = ssh.CreateCommand($"kill -TERM -- -{pid}")) await terminate.ExecuteAsync(cancellationToken);
+        var pgid = lease.RemoteProcessGroupId.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var term = await ExecuteSignalAsync($"kill -TERM -- -{pgid}");
+        if (!term.Acquired) return new(false, false, "实时执行 Lease 已失效；未发送 TERM。");
         await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
-        using var probe = ssh.CreateCommand($"kill -0 -- -{pid} 2>/dev/null");
-        await probe.ExecuteAsync(cancellationToken);
+        var probe = await ExecuteSignalAsync($"kill -0 -- -{pgid} 2>/dev/null");
+        if (!probe.Acquired) return new(true, true, "执行已结束；未发送后续远程信号。");
         if (probe.ExitStatus == 0)
         {
-            using var kill = ssh.CreateCommand($"kill -KILL -- -{pid} 2>/dev/null || true");
-            await kill.ExecuteAsync(cancellationToken);
+            var kill = await ExecuteSignalAsync($"kill -KILL -- -{pgid} 2>/dev/null || true");
+            if (!kill.Acquired) return new(true, true, "执行已结束；未发送 KILL。");
+            await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
+            var finalProbe = await ExecuteSignalAsync($"kill -0 -- -{pgid} 2>/dev/null");
+            if (!finalProbe.Acquired) return new(true, true, "执行已结束；KILL 后无需继续探测。");
+            return new(true, finalProbe.ExitStatus != 0, finalProbe.ExitStatus != 0 ? "远程进程组已结束。" : "已发送 TERM/KILL 信号；请在服务器侧复核。");
         }
-        return new(true, probe.ExitStatus != 0, probe.ExitStatus != 0 ? "远程进程组已结束。" : "已发送 TERM/KILL 信号；请在服务器侧复核。");
+        return new(true, true, "远程进程组已结束。");
+
+        async Task<(bool Acquired, int ExitStatus)> ExecuteSignalAsync(string commandText)
+        {
+            await using var signalLease = await lease.TryAcquireRemoteSignalLeaseAsync(cancellationToken);
+            if (signalLease is null) return (false, -1);
+            using var command = ssh.CreateCommand(commandText);
+            await command.ExecuteAsync(cancellationToken);
+            return (true, command.ExitStatus ?? -1);
+        }
     }
 
     public async Task<ConnectionTestResult> TestConnectionAsync(Guid serverId, CancellationToken cancellationToken)
@@ -171,12 +188,13 @@ public sealed class SshCommandExecutionProvider(
         if (!matches) throw new HostKeyVerificationException(info, true);
     }
 
-    private static async Task PumpAsync(Stream stream, OutputStreamType type, IExecutionOutputSink sink, Func<long, Task>? processId, CancellationToken cancellationToken)
+    internal static async Task PumpAsync(Stream stream, OutputStreamType type, IExecutionOutputSink sink, Func<long, Task>? processId, CancellationToken cancellationToken)
     {
         const int bufferSize = 8192;
         var bytes = new byte[bufferSize];
         var characters = new char[Encoding.UTF8.GetMaxCharCount(bufferSize)];
-        var decoder = new UTF8Encoding(false, true).GetDecoder();
+        var decoder = new UTF8Encoding(false, false).GetDecoder();
+        var invalidUtf8Reported = false;
         var controlPending = processId is not null;
         var controlBuffer = new StringBuilder(128);
         while (true)
@@ -187,19 +205,25 @@ public sealed class SshCommandExecutionProvider(
             if (charsUsed > 0)
             {
                 var text = new string(characters, 0, charsUsed);
+                if (!invalidUtf8Reported && text.Contains('\uFFFD', StringComparison.Ordinal))
+                {
+                    invalidUtf8Reported = true;
+                    await sink.WriteAsync(OutputStreamType.System, "[CommandHub] 远程输出包含非法 UTF-8，已使用替换字符。\n", cancellationToken);
+                }
                 if (controlPending)
                 {
                     controlBuffer.Append(text);
-                    if (controlBuffer.Length > 512) throw new InvalidDataException("SSH 控制帧超过长度上限。");
                     var newline = controlBuffer.ToString().IndexOf('\n', StringComparison.Ordinal);
                     if (newline < 0)
                     {
+                        if (controlBuffer.Length > 512) throw new InvalidDataException("SSH 控制帧超过长度上限。");
                         if (flush) throw new InvalidDataException("SSH 控制帧不完整。");
                         continue;
                     }
+                    if (newline > 512) throw new InvalidDataException("SSH 控制帧超过长度上限。");
                     var frame = controlBuffer.ToString(0, newline).TrimEnd('\r');
-                    var control = ControlPid.Match(frame);
-                    if (!control.Success || !long.TryParse(control.Groups["pid"].Value, out var parsed) || parsed <= 0)
+                    var control = ControlPgid.Match(frame);
+                    if (!control.Success || !long.TryParse(control.Groups["pgid"].Value, out var parsed) || parsed <= 0)
                         throw new InvalidDataException("SSH 控制帧无效。");
                     await processId!(parsed);
                     text = controlBuffer.ToString(newline + 1, controlBuffer.Length - newline - 1);
@@ -208,30 +232,33 @@ public sealed class SshCommandExecutionProvider(
                 }
                 if (text.Length > 0) await sink.WriteAsync(type, text, cancellationToken);
             }
+            if (flush && controlPending) throw new InvalidDataException("SSH 控制帧不完整。");
             if (flush) break;
         }
     }
 
-    internal static string BuildScript(string command, string workingDirectory, int timeoutSeconds)
+    internal static string BuildScript(string command, string workingDirectory, int timeoutSeconds, IRemoteWorkingDirectoryResolver resolver)
     {
         var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(command));
-        var directory = new RemoteWorkingDirectoryResolver().Resolve(workingDirectory, "~");
+        var directory = resolver.Resolve(workingDirectory, "~");
         return $"""
 #!/usr/bin/env bash
 set +e
-cd -- {directory}
-if [ "$?" -ne 0 ]; then
+COMMAND_TEXT="$(printf '%s' '{encoded}' | base64 -d)"
+WORKING_DIRECTORY={directory}
+setsid bash -c '
+COMMAND_PGID="$(ps -o pgid= -p "$$" | tr -d "[:space:]")"
+case "$COMMAND_PGID" in (""|*[!0-9]*) echo "Unable to determine remote process group." >&2; exit 126;; esac
+printf "__COMMANDHUB_CONTROL__:PGID=%s\\n" "$COMMAND_PGID" >&2
+if ! cd -- "$2"; then
   echo "Unable to enter working directory." >&2
   exit 125
 fi
-COMMAND_TEXT="$(printf '%s' '{encoded}' | base64 -d)"
-setsid timeout --signal=TERM --kill-after=5s {timeoutSeconds} bash -lc "$COMMAND_TEXT" &
-COMMAND_PID=$!
-COMMAND_PGID="$(ps -o pgid= -p "$COMMAND_PID" | tr -d '[:space:]')"
-case "$COMMAND_PGID" in (''|*[!0-9]*) echo "Unable to determine remote process group." >&2; kill "$COMMAND_PID" 2>/dev/null; exit 126;; esac
-echo "__COMMANDHUB_CONTROL__:PID=$COMMAND_PGID" >&2
-wait "$COMMAND_PID"
-exit $?
+exec timeout --signal=TERM --kill-after=5s {timeoutSeconds} bash -lc "$1"
+' commandhub "$COMMAND_TEXT" "$WORKING_DIRECTORY" &
+WRAPPER_PID="$!"
+wait "$WRAPPER_PID"
+exit "$?"
 """;
     }
 

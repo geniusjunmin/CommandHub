@@ -80,7 +80,7 @@ public sealed class CommandExecution : Entity
     public string? UserAgent { get; set; }
     public CommandSource Source { get; set; }
     public Guid CorrelationId { get; set; } = Guid.NewGuid();
-    public long? RemoteProcessId { get; set; }
+    public long? RemoteProcessGroupId { get; set; }
     public DateTimeOffset? CancellationRequestedAt { get; set; }
     public string? CancellationRequestedByUserId { get; set; }
     public string? CancellationReason { get; set; }

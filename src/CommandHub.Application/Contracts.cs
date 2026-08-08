@@ -5,7 +5,7 @@ namespace CommandHub.Application;
 public sealed record RiskAnalysis(RiskLevel Level, IReadOnlyList<string> Reasons);
 public sealed record ExecutionQueueItem(Guid ExecutionId, Guid ServerId, string UserId, string CommandText, string WorkingDirectory, int TimeoutSeconds);
 public sealed record ExecutionOutput(Guid ExecutionId, int Sequence, OutputStreamType StreamType, string Content, int ByteLength);
-public sealed record ExecutionStartResult(int ExitCode, bool TimedOut, long? RemoteProcessId);
+public sealed record ExecutionStartResult(int ExitCode, bool TimedOut, long? RemoteProcessGroupId);
 public sealed record CancelExecutionResult(bool Requested, bool RemoteTerminationConfirmed, string Message);
 public sealed record LiveExecutionHandle(Guid ExecutionId, Guid ServerId, string ProviderName, long? RemoteProcessGroupId, CancellationTokenSource CancellationTokenSource, DateTimeOffset StartedAt, Guid ExecutionNonce);
 public sealed record HostKeyInfo(string Algorithm, string Fingerprint);
@@ -90,16 +90,28 @@ public interface IRemoteWorkingDirectoryResolver { string Resolve(string? workin
 public interface ILiveExecutionRegistry
 {
     LiveExecutionHandle Register(Guid executionId, Guid serverId, string providerName, CancellationToken applicationToken);
-    bool TryGet(Guid executionId, out LiveExecutionHandle? handle);
     bool TrySetRemoteProcessGroupId(Guid executionId, Guid nonce, long processGroupId);
-    bool RequestCancellation(Guid executionId);
+    bool TryAcquireCancellationLease(Guid executionId, out ILiveExecutionCancellationLease? lease);
     bool Remove(Guid executionId, Guid nonce);
+}
+
+public interface ILiveExecutionCancellationLease : IDisposable
+{
+    Guid ExecutionId { get; }
+    Guid ServerId { get; }
+    string ProviderName { get; }
+    Guid ExecutionNonce { get; }
+    long? RemoteProcessGroupId { get; }
+    CancellationTokenSource CancellationTokenSource { get; }
+    bool IsValid { get; }
+    bool TryRequestLocalCancellation();
+    ValueTask<IAsyncDisposable?> TryAcquireRemoteSignalLeaseAsync(CancellationToken cancellationToken);
 }
 
 public interface IExecutionOutputSink
 {
     Task WriteAsync(OutputStreamType streamType, string content, CancellationToken cancellationToken);
-    Task SetRemoteProcessIdAsync(long processId, CancellationToken cancellationToken);
+    Task SetRemoteProcessGroupIdAsync(long processGroupId, CancellationToken cancellationToken);
 }
 
 public interface IExecutionNotifier
@@ -114,7 +126,7 @@ public interface ICommandExecutionProvider
 {
     string ProviderName { get; }
     Task<ExecutionStartResult> StartAsync(ExecutionQueueItem request, IExecutionOutputSink outputSink, CancellationToken cancellationToken);
-    Task<CancelExecutionResult> CancelAsync(LiveExecutionHandle handle, CancellationToken cancellationToken);
+    Task<CancelExecutionResult> CancelAsync(ILiveExecutionCancellationLease lease, CancellationToken cancellationToken);
 }
 
 public interface IExecutionQueue

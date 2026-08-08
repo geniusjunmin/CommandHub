@@ -20,6 +20,8 @@ public sealed class CommandHubService(
     ICommandExecutionProvider executionProvider,
     SshCommandExecutionProvider sshProvider,
     ILiveExecutionRegistry liveRegistry,
+    IExecutionNotifier notifier,
+    IRemoteWorkingDirectoryResolver workingDirectoryResolver,
     IOptions<ExecutionOptions> executionOptions,
     IOptions<SecurityOptions> securityOptions,
     UserManager<ApplicationUser> userManager) : ICommandHubService
@@ -80,6 +82,7 @@ public sealed class CommandHubService(
         server.Port = model.Port;
         server.DefaultUsername = model.DefaultUsername.Trim();
         server.DefaultWorkingDirectory = string.IsNullOrWhiteSpace(model.DefaultWorkingDirectory) ? "~" : model.DefaultWorkingDirectory.Trim();
+        _ = workingDirectoryResolver.Resolve(server.DefaultWorkingDirectory, "~");
         server.Environment = model.Environment;
         server.IsEnabled = model.IsEnabled;
         server.UpdatedAt = DateTimeOffset.UtcNow;
@@ -218,6 +221,9 @@ public sealed class CommandHubService(
         var masked = maskingService.Mask(submission.CommandText);
         var normalized = DomainRules.NormalizeCommand(masked);
         var timeout = Math.Clamp(submission.TimeoutSeconds ?? _executionOptions.DefaultTimeoutSeconds, 1, _executionOptions.MaximumTimeoutSeconds);
+        var workingDirectory = string.IsNullOrWhiteSpace(submission.WorkingDirectory) ? server.DefaultWorkingDirectory : submission.WorkingDirectory.Trim();
+        try { _ = workingDirectoryResolver.Resolve(workingDirectory, server.DefaultWorkingDirectory); }
+        catch (ArgumentException exception) { return await RejectedAsync(exception.Message); }
         var execution = new CommandExecution
         {
             ServerId = server.Id,
@@ -227,7 +233,7 @@ public sealed class CommandHubService(
             NormalizedCommand = submission.DoNotSaveCommand ? "[not-saved]" : normalized,
             NormalizedCommandHash = DomainRules.ComputeCommandHash(submission.DoNotSaveCommand ? "[not-saved]" : normalized),
             NormalizedCommandPrefix = (submission.DoNotSaveCommand ? "[not-saved]" : normalized)[..Math.Min(submission.DoNotSaveCommand ? 11 : normalized.Length, DomainRules.NormalizedCommandPrefixCharacters)],
-            WorkingDirectory = string.IsNullOrWhiteSpace(submission.WorkingDirectory) ? server.DefaultWorkingDirectory : submission.WorkingDirectory.Trim(),
+            WorkingDirectory = workingDirectory,
             RiskLevel = risk.Level,
             RiskReasons = JsonSerializer.Serialize(risk.Reasons),
             Source = submission.Source,
@@ -256,33 +262,53 @@ public sealed class CommandHubService(
     public async Task<CancelExecutionResult> CancelAsync(Guid executionId, string userId, bool isAdministrator, CancellationToken cancellationToken = default)
     {
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
-        var execution = await db.CommandExecutions.SingleOrDefaultAsync(x => x.Id == executionId, cancellationToken) ?? throw new KeyNotFoundException("执行记录不存在。");
+        var execution = await db.CommandExecutions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == executionId, cancellationToken) ?? throw new KeyNotFoundException("执行记录不存在。");
         if (!isAdministrator && execution.UserId != userId) throw new UnauthorizedAccessException("无权取消此执行。");
-        if (execution.Status is not (ExecutionStatus.Pending or ExecutionStatus.Queued or ExecutionStatus.Running))
-            throw new ExecutionCancellationConflictException(execution.Status);
-        execution.CancellationRequestedAt = DateTimeOffset.UtcNow;
-        execution.CancellationRequestedByUserId = userId;
-        execution.CancellationReason = "UserRequested";
-        if (execution.Status is ExecutionStatus.Pending or ExecutionStatus.Queued)
+        var now = DateTimeOffset.UtcNow;
+        var cancelled = await db.CommandExecutions
+            .Where(x => x.Id == executionId && (x.Status == ExecutionStatus.Pending || x.Status == ExecutionStatus.Queued))
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, ExecutionStatus.Cancelled)
+                .SetProperty(x => x.WasCancelled, true)
+                .SetProperty(x => x.CancellationRequestedAt, now)
+                .SetProperty(x => x.CancellationRequestedByUserId, userId)
+                .SetProperty(x => x.CancellationReason, "UserRequested")
+                .SetProperty(x => x.FinishedAt, now)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken);
+        if (cancelled == 1)
         {
-            execution.Status = ExecutionStatus.Cancelled;
-            execution.WasCancelled = true;
-            execution.FinishedAt = DateTimeOffset.UtcNow;
-            AddAudit(db, userId, "CommandCancelled", "CommandExecution", executionId.ToString(), "排队中的执行已取消。", new { PreviousStatus = "Queued" }, correlationId: execution.CorrelationId);
+            AddAudit(db, userId, "CommandCancelled", "CommandExecution", executionId.ToString(), "排队中的执行已取消。", new { PreviousStatus = execution.Status.ToString() }, correlationId: execution.CorrelationId);
             await db.SaveChangesAsync(cancellationToken);
+            await notifier.StatusChangedAsync(executionId, ExecutionStatus.Cancelled, cancellationToken);
+            await notifier.ExecutionCompletedAsync(executionId, ExecutionStatus.Cancelled, null, cancellationToken);
             return new(true, false, "排队中的执行已取消，Worker 将跳过该任务。");
         }
-        if (!liveRegistry.TryGet(executionId, out var handle) || handle is null)
+
+        var latest = await db.CommandExecutions.AsNoTracking().SingleAsync(x => x.Id == executionId, cancellationToken);
+        if (latest.Status != ExecutionStatus.Running) throw new ExecutionCancellationConflictException(latest.Status);
+        await db.CommandExecutions.Where(x => x.Id == executionId && x.Status == ExecutionStatus.Running)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.CancellationRequestedAt, now)
+                .SetProperty(x => x.CancellationRequestedByUserId, userId)
+                .SetProperty(x => x.CancellationReason, "UserRequested")
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken);
+
+        if (!liveRegistry.TryAcquireCancellationLease(executionId, out var lease) || lease is null)
         {
+            var afterLeaseFailure = await db.CommandExecutions.AsNoTracking().SingleAsync(x => x.Id == executionId, cancellationToken);
+            if (afterLeaseFailure.Status != ExecutionStatus.Running) throw new ExecutionCancellationConflictException(afterLeaseFailure.Status);
             AddAudit(db, userId, "CommandCancellationRequested", "CommandExecution", executionId.ToString(), "执行仍标记为 Running，但当前实例没有实时句柄；未使用历史 PID。", new { LiveHandle = false }, correlationId: execution.CorrelationId);
             await db.SaveChangesAsync(cancellationToken);
             return new(true, false, "当前实例没有实时执行句柄；为避免 PID/PGID 复用误杀，未发送远程信号。");
         }
-        var localRequested = liveRegistry.RequestCancellation(executionId);
-        var remote = await executionProvider.CancelAsync(handle, cancellationToken);
-        AddAudit(db, userId, "CommandCancellationRequested", "CommandExecution", executionId.ToString(), remote.Message, new { LocalCancellationRequested = localRequested, remote.RemoteTerminationConfirmed });
-        await db.SaveChangesAsync(cancellationToken);
-        return remote with { Requested = localRequested || remote.Requested };
+        using (lease)
+        {
+            var remote = await executionProvider.CancelAsync(lease, cancellationToken);
+            var localRequested = lease.TryRequestLocalCancellation();
+            AddAudit(db, userId, "CommandCancellationRequested", "CommandExecution", executionId.ToString(), remote.Message, new { LocalCancellationRequested = localRequested, remote.RemoteTerminationConfirmed }, correlationId: execution.CorrelationId);
+            await db.SaveChangesAsync(cancellationToken);
+            return remote with { Requested = localRequested || remote.Requested };
+        }
     }
 
     public async Task<PagedResult<ExecutionListItem>> SearchHistoryAsync(HistoryQuery query, string userId, bool canAuditAll, CancellationToken cancellationToken = default)
@@ -380,6 +406,7 @@ public sealed class CommandHubService(
     {
         if (string.IsNullOrWhiteSpace(commandTemplate.Name) || string.IsNullOrWhiteSpace(commandTemplate.CommandText)) throw new DomainValidationException("模板名称和命令不能为空。");
         DomainRules.ValidateCommandLength(commandTemplate.CommandText);
+        _ = workingDirectoryResolver.Resolve(commandTemplate.DefaultWorkingDirectory, "~");
         ValidateTemplateParameters(commandTemplate);
         if (!isAdministrator && commandTemplate.Parameters.Any(x => x.EscapeMode == TemplateEscapeMode.Raw)) throw new UnauthorizedAccessException("只有系统管理员可以保存 Raw 参数。");
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
