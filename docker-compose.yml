@@ -32,7 +32,7 @@ services:
       COMMANDHUB_ADMIN_EMAIL: ${COMMANDHUB_ADMIN_EMAIL:?Set COMMANDHUB_ADMIN_EMAIL in .env}
       COMMANDHUB_ADMIN_PASSWORD: ${COMMANDHUB_ADMIN_PASSWORD:?Set COMMANDHUB_ADMIN_PASSWORD in .env}
       DataProtection__KeysPath: /app/keys
-      ReverseProxy__TrustedProxyHosts__0: caddy
+      ReverseProxy__TrustedProxyHosts__0: 172.28.0.254
       Database__ApplyMigrationsOnStartup: "false"
       Database__InitializeOnStartup: "true"
       Security__AllowCriticalCommands: ${ALLOW_CRITICAL_COMMANDS:-false}
@@ -70,7 +70,9 @@ services:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    networks: [backend]
+    networks:
+      backend:
+        ipv4_address: 172.28.0.254
 
   ssh-fixture:
     image: lscr.io/linuxserver/openssh-server@sha256:9c5e178975fcc3917853f5e37cbf135ad7deb11de504ab0f460cc81a2e1eb539
@@ -92,6 +94,9 @@ services:
 networks:
   backend:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
 
 volumes:
   postgres-data:
