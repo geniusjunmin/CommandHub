@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_DB: commandhub_test
+          POSTGRES_USER: commandhub
+          POSTGRES_PASSWORD: CI-${{ github.run_id }}-Aa1!
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U commandhub -d commandhub_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      ssh-fixture:
+        image: lscr.io/linuxserver/openssh-server@sha256:9c5e178975fcc3917853f5e37cbf135ad7deb11de504ab0f460cc81a2e1eb539
+        env:
+          PUID: "1000"
+          PGID: "1000"
+          USER_NAME: commandhub
+          PASSWORD_ACCESS: "true"
+          USER_PASSWORD: CI-${{ github.run_id }}-Aa1!
+          SUDO_ACCESS: "false"
+        ports:
+          - 2222:2222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: '**/*.csproj'
+      - run: dotnet restore
+      - run: dotnet format --verify-no-changes --no-restore
+      - run: dotnet build --configuration Release --no-restore
+      - run: dotnet test --configuration Release --no-build --logger trx --results-directory TestResults --collect:"XPlat Code Coverage" --settings tests/coverage.runsettings
+        env:
+          COMMANDHUB_TEST_POSTGRES: Host=localhost;Port=5432;Database=commandhub_test;Username=commandhub;Password=CI-${{ github.run_id }}-Aa1!
+          COMMANDHUB_TEST_SSH_PASSWORD: CI-${{ github.run_id }}-Aa1!
+      - name: Enforce core coverage thresholds
+        run: ./scripts/check-coverage.sh TestResults
+      - run: dotnet list package --vulnerable --include-transitive
+      - run: POSTGRES_PASSWORD=compose-validation COMMANDHUB_ADMIN_EMAIL=admin@example.invalid COMMANDHUB_ADMIN_PASSWORD=compose-validation SSH_FIXTURE_PASSWORD=fixture-validation docker compose config
+      - run: docker build --tag commandhub:ci .
+      - name: Start and health-check the Compose stack
+        env:
+          POSTGRES_PASSWORD: CI-compose-${{ github.run_id }}-Aa1!
+          COMMANDHUB_ADMIN_EMAIL: admin@example.invalid
+          COMMANDHUB_ADMIN_PASSWORD: CI-admin-${{ github.run_id }}-Aa1!
+          SSH_FIXTURE_PASSWORD: CI-ssh-${{ github.run_id }}-Aa1!
+        run: |
+          set -Eeuo pipefail
+          cleanup() {
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml logs --no-color || true
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml down --volumes
+          }
+          trap cleanup EXIT
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml ps
+          curl --fail --insecure --retry 20 --retry-delay 3 --retry-all-errors https://localhost/health/live
+          curl --fail --insecure --retry 20 --retry-delay 3 --retry-all-errors https://localhost/health/ready
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: TestResults/**
+          if-no-files-found: warn

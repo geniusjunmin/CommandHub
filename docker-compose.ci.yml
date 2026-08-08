@@ -1,0 +1,5 @@
+services:
+  commandhub:
+    environment:
+      Database__ApplyMigrationsOnStartup: "true"
+      Database__InitializeOnStartup: "true"

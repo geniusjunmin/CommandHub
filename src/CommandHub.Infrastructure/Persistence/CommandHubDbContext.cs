@@ -1,5 +1,6 @@
 using CommandHub.Domain;
 using CommandHub.Infrastructure.Identity;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 
@@ -7,6 +8,8 @@ namespace CommandHub.Infrastructure.Persistence;
 
 public sealed class CommandHubDbContext(DbContextOptions<CommandHubDbContext> options) : IdentityDbContext<ApplicationUser>(options)
 {
+    protected override Version SchemaVersion => IdentitySchemaVersions.Version3;
+
     public DbSet<Server> Servers => Set<Server>();
     public DbSet<ServerCredential> ServerCredentials => Set<ServerCredential>();
     public DbSet<UserServerPermission> UserServerPermissions => Set<UserServerPermission>();
@@ -62,9 +65,14 @@ public sealed class CommandHubDbContext(DbContextOptions<CommandHubDbContext> op
             entity.HasIndex(x => x.CreatedAt);
             entity.HasIndex(x => new { x.UserId, x.CreatedAt });
             entity.HasIndex(x => new { x.ServerId, x.Status, x.CreatedAt });
-            entity.HasIndex(x => x.NormalizedCommand);
-            entity.Property(x => x.NormalizedCommand).HasMaxLength(8192);
-            entity.Property(x => x.MaskedCommandText).HasMaxLength(8192);
+            entity.HasIndex(x => x.NormalizedCommandHash);
+            entity.Property(x => x.CommandText).HasColumnType("text");
+            entity.Property(x => x.NormalizedCommand).HasColumnType("text");
+            entity.Property(x => x.MaskedCommandText).HasColumnType("text");
+            entity.Property(x => x.NormalizedCommandHash).HasMaxLength(64).IsFixedLength();
+            entity.Property(x => x.NormalizedCommandPrefix).HasMaxLength(DomainRules.NormalizedCommandPrefixCharacters);
+            entity.Property(x => x.CancellationRequestedByUserId).HasMaxLength(450);
+            entity.Property(x => x.CancellationReason).HasMaxLength(500);
             entity.Property(x => x.WorkingDirectory).HasMaxLength(1024);
             entity.Property(x => x.Shell).HasMaxLength(32);
             entity.Property(x => x.RiskReasons).HasColumnType("jsonb");
@@ -105,7 +113,7 @@ public sealed class CommandHubDbContext(DbContextOptions<CommandHubDbContext> op
         {
             entity.HasIndex(x => new { x.CreatedByUserId, x.Name }).IsUnique();
             entity.Property(x => x.Name).HasMaxLength(120);
-            entity.Property(x => x.CommandText).HasMaxLength(8192);
+            entity.Property(x => x.CommandText).HasColumnType("text");
             entity.Property(x => x.RowVersion).IsConcurrencyToken();
             entity.HasOne(x => x.Server).WithMany().HasForeignKey(x => x.ServerId).OnDelete(DeleteBehavior.SetNull);
         });

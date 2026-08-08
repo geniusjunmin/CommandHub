@@ -17,7 +17,7 @@ public sealed class ExecutionWorkerService(
     IDbContextFactory<CommandHubDbContext> dbFactory,
     IExecutionNotifier notifier,
     ICommandClassificationService classifier,
-    ExecutionCancellationRegistry cancellationRegistry,
+    ILiveExecutionRegistry liveRegistry,
     IOptions<ExecutionOptions> options,
     ILogger<ExecutionWorkerService> logger) : BackgroundService
 {
@@ -59,47 +59,65 @@ public sealed class ExecutionWorkerService(
 
     private async Task ProcessAsync(ExecutionQueueItem item, CancellationToken stoppingToken)
     {
-        var cancellationToken = cancellationRegistry.Register(item.ExecutionId, stoppingToken);
+        var claimed = await ClaimQueuedExecutionAsync(item.ExecutionId, stoppingToken);
+        if (!claimed) return;
+        var handle = liveRegistry.Register(item.ExecutionId, item.ServerId, provider.ProviderName, stoppingToken);
+        var cancellationToken = handle.CancellationTokenSource.Token;
         try
         {
-            await UpdateStatusAsync(item.ExecutionId, ExecutionStatus.Running, cancellationToken);
             await notifier.ExecutionStartedAsync(item.ExecutionId, cancellationToken);
-            using var sink = new DatabaseOutputSink(item.ExecutionId, dbFactory, notifier, _options);
+            using var sink = new DatabaseOutputSink(item.ExecutionId, handle.ExecutionNonce, dbFactory, notifier, liveRegistry, _options);
             var result = await provider.StartAsync(item, sink, cancellationToken);
-            var status = result.TimedOut ? ExecutionStatus.TimedOut : result.ExitCode == 0 ? ExecutionStatus.Succeeded : ExecutionStatus.Failed;
-            await CompleteAsync(item.ExecutionId, status, result.ExitCode, result.TimedOut, false, result.RemoteProcessId, CancellationToken.None);
+            liveRegistry.Remove(item.ExecutionId, handle.ExecutionNonce);
+            var status = await WasCancellationRequestedAsync(item.ExecutionId, CancellationToken.None)
+                ? ExecutionStatus.Cancelled
+                : result.TimedOut ? ExecutionStatus.TimedOut : result.ExitCode == 0 ? ExecutionStatus.Succeeded : ExecutionStatus.Failed;
+            await CompleteAsync(item.ExecutionId, status, result.ExitCode, result.TimedOut, status == ExecutionStatus.Cancelled, result.RemoteProcessGroupId, CancellationToken.None);
             await AddAutomaticTagsAsync(item.ExecutionId, item.CommandText, CancellationToken.None);
             await notifier.ExecutionCompletedAsync(item.ExecutionId, status, result.ExitCode, CancellationToken.None);
         }
         catch (OperationCanceledException)
         {
+            liveRegistry.Remove(item.ExecutionId, handle.ExecutionNonce);
             await CompleteAsync(item.ExecutionId, ExecutionStatus.Cancelled, null, false, true, null, CancellationToken.None);
             await notifier.ExecutionCompletedAsync(item.ExecutionId, ExecutionStatus.Cancelled, null, CancellationToken.None);
         }
         catch (HostKeyVerificationException exception)
         {
+            liveRegistry.Remove(item.ExecutionId, handle.ExecutionNonce);
             logger.LogWarning("Execution {ExecutionId} rejected because SSH host key verification failed: {Reason}", item.ExecutionId, exception.Message);
             await CompleteAsync(item.ExecutionId, ExecutionStatus.ConnectionFailed, null, false, false, null, CancellationToken.None);
             await notifier.ExecutionCompletedAsync(item.ExecutionId, ExecutionStatus.ConnectionFailed, null, CancellationToken.None);
         }
         catch (Exception exception)
         {
+            liveRegistry.Remove(item.ExecutionId, handle.ExecutionNonce);
             logger.LogError(exception, "Execution {ExecutionId} failed.", item.ExecutionId);
             await CompleteAsync(item.ExecutionId, ExecutionStatus.Failed, null, false, false, null, CancellationToken.None);
             await notifier.ExecutionCompletedAsync(item.ExecutionId, ExecutionStatus.Failed, null, CancellationToken.None);
         }
-        finally { cancellationRegistry.Remove(item.ExecutionId); }
+        finally { liveRegistry.Remove(item.ExecutionId, handle.ExecutionNonce); }
     }
 
-    private async Task UpdateStatusAsync(Guid executionId, ExecutionStatus status, CancellationToken cancellationToken)
+    private async Task<bool> ClaimQueuedExecutionAsync(Guid executionId, CancellationToken cancellationToken)
     {
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
-        var execution = await db.CommandExecutions.SingleAsync(x => x.Id == executionId, cancellationToken);
-        execution.Status = status;
-        execution.StartedAt = DateTimeOffset.UtcNow;
-        execution.UpdatedAt = DateTimeOffset.UtcNow;
-        await db.SaveChangesAsync(cancellationToken);
-        await notifier.StatusChangedAsync(executionId, status, cancellationToken);
+        var now = DateTimeOffset.UtcNow;
+        var updated = await db.CommandExecutions
+            .Where(x => x.Id == executionId && x.Status == ExecutionStatus.Queued && x.CancellationRequestedAt == null)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(x => x.Status, ExecutionStatus.Running)
+                .SetProperty(x => x.StartedAt, now)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken);
+        if (updated == 1) await notifier.StatusChangedAsync(executionId, ExecutionStatus.Running, cancellationToken);
+        return updated == 1;
+    }
+
+    private async Task<bool> WasCancellationRequestedAsync(Guid executionId, CancellationToken cancellationToken)
+    {
+        await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
+        return await db.CommandExecutions.AsNoTracking().Where(x => x.Id == executionId)
+            .Select(x => x.CancellationRequestedAt != null).SingleAsync(cancellationToken);
     }
 
     private async Task CompleteAsync(Guid executionId, ExecutionStatus status, int? exitCode, bool timedOut, bool cancelled, long? processId, CancellationToken cancellationToken)
@@ -110,7 +128,7 @@ public sealed class ExecutionWorkerService(
         execution.ExitCode = exitCode;
         execution.TimedOut = timedOut;
         execution.WasCancelled = cancelled;
-        execution.RemoteProcessId ??= processId;
+        execution.RemoteProcessGroupId ??= processId;
         execution.FinishedAt = DateTimeOffset.UtcNow;
         execution.DurationMilliseconds = execution.StartedAt is null ? null : (long)(execution.FinishedAt.Value - execution.StartedAt.Value).TotalMilliseconds;
         execution.UpdatedAt = DateTimeOffset.UtcNow;
@@ -132,27 +150,30 @@ public sealed class ExecutionWorkerService(
     }
 }
 
-internal sealed class DatabaseOutputSink(Guid executionId, IDbContextFactory<CommandHubDbContext> dbFactory, IExecutionNotifier notifier, ExecutionOptions options) : IExecutionOutputSink, IDisposable
+internal sealed class DatabaseOutputSink(Guid executionId, Guid executionNonce, IDbContextFactory<CommandHubDbContext> dbFactory, IExecutionNotifier notifier, ILiveExecutionRegistry liveRegistry, ExecutionOptions options) : IExecutionOutputSink, IDisposable
 {
-    private static readonly Regex Ansi = new(@"[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))", RegexOptions.Compiled, TimeSpan.FromMilliseconds(100));
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly ConcurrentDictionary<OutputStreamType, StatefulAnsiSanitizer> _ansi = new();
     private int _sequence;
     private long _totalBytes;
     private bool _truncationRecorded;
 
     public async Task WriteAsync(OutputStreamType streamType, string content, CancellationToken cancellationToken)
     {
-        var safe = Ansi.Replace(content.Replace("\0", string.Empty, StringComparison.Ordinal), string.Empty);
+        var sanitizer = _ansi.GetOrAdd(streamType, static _ => new StatefulAnsiSanitizer());
+        var safe = sanitizer.Process(content.Replace("\0", string.Empty, StringComparison.Ordinal));
         foreach (var chunk in SplitByUtf8Bytes(safe, options.OutputChunkBytes))
             await WriteChunkAsync(streamType, chunk, cancellationToken);
     }
 
-    public async Task SetRemoteProcessIdAsync(long processId, CancellationToken cancellationToken)
+    public async Task SetRemoteProcessGroupIdAsync(long processGroupId, CancellationToken cancellationToken)
     {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(processId);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(processGroupId);
+        if (!liveRegistry.TrySetRemoteProcessGroupId(executionId, executionNonce, processGroupId))
+            throw new InvalidOperationException("实时执行句柄已失效，拒绝登记远程进程组。");
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
         var execution = await db.CommandExecutions.SingleAsync(x => x.Id == executionId, cancellationToken);
-        execution.RemoteProcessId = processId;
+        execution.RemoteProcessGroupId = processGroupId;
         await db.SaveChangesAsync(cancellationToken);
     }
 
@@ -209,4 +230,40 @@ internal sealed class DatabaseOutputSink(Guid executionId, IDbContextFactory<Com
     }
 
     public void Dispose() => _gate.Dispose();
+}
+
+internal sealed class StatefulAnsiSanitizer
+{
+    private State _state;
+    public string Process(string value)
+    {
+        var result = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            switch (_state)
+            {
+                case State.Normal:
+                    if (character == '\u001B') _state = State.Escape;
+                    else if (character == '\u009B') _state = State.Csi;
+                    else result.Append(character);
+                    break;
+                case State.Escape:
+                    _state = character switch { '[' => State.Csi, ']' => State.Osc, _ => State.Normal };
+                    break;
+                case State.Csi:
+                    if (character is >= '@' and <= '~') _state = State.Normal;
+                    break;
+                case State.Osc:
+                    if (character == '\a') _state = State.Normal;
+                    else if (character == '\u001B') _state = State.OscEscape;
+                    break;
+                case State.OscEscape:
+                    _state = character == '\\' ? State.Normal : State.Osc;
+                    break;
+            }
+        }
+        return result.ToString();
+    }
+
+    private enum State { Normal, Escape, Csi, Osc, OscEscape }
 }

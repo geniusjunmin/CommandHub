@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Security.Claims;
 using System.Text;
 using System.Threading.RateLimiting;
@@ -20,6 +21,22 @@ using Microsoft.EntityFrameworkCore;
 var builder = WebApplication.CreateBuilder(args);
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection 未配置。");
+var forwardedHeadersOptions = new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedHost,
+    ForwardLimit = 1,
+};
+foreach (var trustedProxyHost in builder.Configuration.GetSection("ReverseProxy:TrustedProxyHosts").Get<string[]>() ?? [])
+{
+    var addresses = IPAddress.TryParse(trustedProxyHost, out var address) ? [address] : await Dns.GetHostAddressesAsync(trustedProxyHost);
+    if (addresses.Length == 0) throw new InvalidOperationException($"无法解析可信反向代理 {trustedProxyHost}。");
+    foreach (var trustedAddress in addresses)
+    {
+        forwardedHeadersOptions.KnownProxies.Add(trustedAddress);
+        if (trustedAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            forwardedHeadersOptions.KnownProxies.Add(trustedAddress.MapToIPv6());
+    }
+}
 
 builder.Services.AddRazorComponents().AddInteractiveServerComponents();
 builder.Services.AddCascadingAuthenticationState();
@@ -57,7 +74,6 @@ builder.Services.AddIdentityCore<ApplicationUser>(options =>
     options.Password.RequireLowercase = true;
     options.Password.RequireDigit = true;
     options.Password.RequireNonAlphanumeric = true;
-    options.Stores.SchemaVersion = IdentitySchemaVersions.Version3;
 }).AddRoles<IdentityRole>().AddEntityFrameworkStores<CommandHubDbContext>().AddSignInManager().AddDefaultTokenProviders();
 builder.Services.AddSingleton<IEmailSender<ApplicationUser>, IdentityNoOpEmailSender>();
 
@@ -89,11 +105,11 @@ builder.Services.AddRateLimiter(options =>
 });
 
 var app = builder.Build();
-app.UseForwardedHeaders(new ForwardedHeadersOptions { ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto });
+app.UseForwardedHeaders(forwardedHeadersOptions);
 if (app.Environment.IsDevelopment()) app.UseMigrationsEndPoint();
 else { app.UseExceptionHandler("/Error", createScopeForErrors: true); app.UseHsts(); }
 app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
-app.UseHttpsRedirection();
+app.UseWhen(context => !context.Request.Path.StartsWithSegments("/health"), branch => branch.UseHttpsRedirection());
 app.Use(async (context, next) =>
 {
     context.Response.Headers.XContentTypeOptions = "nosniff";
@@ -141,7 +157,14 @@ static void MapCommandHubApi(WebApplication app)
     api.MapPost("/executions/{id:guid}/cancel", async (Guid id, ClaimsPrincipal user, HttpContext http, IAntiforgery antiforgery, ICommandHubService service, CancellationToken ct) =>
     {
         await antiforgery.ValidateRequestAsync(http);
-        return Results.Ok(await service.CancelAsync(id, user.FindFirstValue(ClaimTypes.NameIdentifier)!, user.IsInRole(SystemRoles.SystemAdministrator), ct));
+        try
+        {
+            return Results.Ok(await service.CancelAsync(id, user.FindFirstValue(ClaimTypes.NameIdentifier)!, user.IsInRole(SystemRoles.SystemAdministrator), ct));
+        }
+        catch (CommandHub.Infrastructure.Services.ExecutionCancellationConflictException exception)
+        {
+            return Results.Conflict(new { error = exception.Message, status = exception.Status.ToString() });
+        }
     }).RequireAuthorization("Execute");
     api.MapGet("/executions/{id:guid}/output", async (Guid id, ClaimsPrincipal user, ICommandHubService service, CancellationToken ct) =>
     {

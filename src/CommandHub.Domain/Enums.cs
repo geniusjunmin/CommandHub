@@ -3,7 +3,7 @@ namespace CommandHub.Domain;
 public enum ServerEnvironment { Development, Testing, Staging, Production, Other }
 public enum CredentialType { Password, PrivateKey }
 public enum PermissionLevel { Viewer, Operator, Administrator }
-public enum ExecutionStatus { Pending, Queued, Running, Succeeded, Failed, Cancelled, TimedOut, Rejected, ConnectionFailed }
+public enum ExecutionStatus { Pending, Queued, Running, Succeeded, Failed, Cancelled, TimedOut, Rejected, ConnectionFailed, Interrupted }
 public enum CommandSource { Web, Template, History, Api, Imported }
 public enum RiskLevel { Low, Medium, High, Critical }
 public enum OutputStreamType { StandardOutput, StandardError, System }

@@ -29,26 +29,124 @@ public sealed class ExecutionQueue : IExecutionQueue
     public void Complete() => _channel.Writer.TryComplete();
 }
 
-public sealed class ExecutionCancellationRegistry
+public sealed class LiveExecutionRegistry : ILiveExecutionRegistry
 {
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, CancellationTokenSource> _sources = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, Entry> _handles = new();
 
-    public CancellationToken Register(Guid executionId, CancellationToken applicationToken)
+    public LiveExecutionHandle Register(Guid executionId, Guid serverId, string providerName, CancellationToken applicationToken)
     {
         var source = CancellationTokenSource.CreateLinkedTokenSource(applicationToken);
-        if (!_sources.TryAdd(executionId, source)) source.Dispose();
-        return _sources[executionId].Token;
+        var handle = new LiveExecutionHandle(executionId, serverId, providerName, null, source, DateTimeOffset.UtcNow, Guid.NewGuid());
+        if (!_handles.TryAdd(executionId, new Entry(handle)))
+        {
+            source.Dispose();
+            throw new InvalidOperationException("执行已在实时注册表中。");
+        }
+        return handle;
     }
 
-    public bool Cancel(Guid executionId)
+    public bool TrySetRemoteProcessGroupId(Guid executionId, Guid nonce, long processGroupId)
     {
-        if (!_sources.TryGetValue(executionId, out var source)) return false;
-        source.Cancel();
-        return true;
+        if (processGroupId <= 0 || !_handles.TryGetValue(executionId, out var entry)) return false;
+        entry.Gate.Wait();
+        try
+        {
+            if (!entry.Active || entry.Handle.ExecutionNonce != nonce) return false;
+            entry.Handle = entry.Handle with { RemoteProcessGroupId = processGroupId };
+            return true;
+        }
+        finally { entry.Gate.Release(); }
     }
 
-    public void Remove(Guid executionId)
+    public bool TryAcquireCancellationLease(Guid executionId, out ILiveExecutionCancellationLease? lease)
     {
-        if (_sources.TryRemove(executionId, out var source)) source.Dispose();
+        lease = null;
+        if (!_handles.TryGetValue(executionId, out var entry)) return false;
+        entry.Gate.Wait();
+        try
+        {
+            if (!entry.Active || entry.CancellationStarted) return false;
+            entry.CancellationStarted = true;
+            lease = new CancellationLease(this, entry, entry.Handle);
+            return true;
+        }
+        finally { entry.Gate.Release(); }
+    }
+
+    public bool Remove(Guid executionId, Guid nonce)
+    {
+        if (!_handles.TryGetValue(executionId, out var entry)) return false;
+        entry.Gate.Wait();
+        try
+        {
+            if (!entry.Active || entry.Handle.ExecutionNonce != nonce) return false;
+            entry.Active = false;
+            if (!_handles.TryRemove(new KeyValuePair<Guid, Entry>(executionId, entry))) return false;
+            entry.Handle.CancellationTokenSource.Dispose();
+            return true;
+        }
+        finally { entry.Gate.Release(); }
+    }
+
+    private bool IsValid(Entry entry, Guid nonce) =>
+        _handles.TryGetValue(entry.Handle.ExecutionId, out var current)
+        && ReferenceEquals(current, entry) && entry.Active && entry.Handle.ExecutionNonce == nonce;
+
+    private sealed class Entry(LiveExecutionHandle handle)
+    {
+        public SemaphoreSlim Gate { get; } = new(1, 1);
+        public LiveExecutionHandle Handle { get; set; } = handle;
+        public bool Active { get; set; } = true;
+        public bool CancellationStarted { get; set; }
+    }
+
+    private sealed class CancellationLease(LiveExecutionRegistry owner, Entry entry, LiveExecutionHandle snapshot) : ILiveExecutionCancellationLease
+    {
+        public Guid ExecutionId => snapshot.ExecutionId;
+        public Guid ServerId => snapshot.ServerId;
+        public string ProviderName => snapshot.ProviderName;
+        public Guid ExecutionNonce => snapshot.ExecutionNonce;
+        public long? RemoteProcessGroupId => snapshot.RemoteProcessGroupId;
+        public CancellationTokenSource CancellationTokenSource => snapshot.CancellationTokenSource;
+        public bool IsValid
+        {
+            get
+            {
+                entry.Gate.Wait();
+                try { return owner.IsValid(entry, snapshot.ExecutionNonce); }
+                finally { entry.Gate.Release(); }
+            }
+        }
+        public bool TryRequestLocalCancellation()
+        {
+            entry.Gate.Wait();
+            try
+            {
+                if (!owner.IsValid(entry, snapshot.ExecutionNonce)) return false;
+                snapshot.CancellationTokenSource.Cancel();
+                return true;
+            }
+            finally { entry.Gate.Release(); }
+        }
+        public async ValueTask<IAsyncDisposable?> TryAcquireRemoteSignalLeaseAsync(CancellationToken cancellationToken)
+        {
+            await entry.Gate.WaitAsync(cancellationToken);
+            if (!owner.IsValid(entry, snapshot.ExecutionNonce))
+            {
+                entry.Gate.Release();
+                return null;
+            }
+            return new RemoteSignalLease(entry.Gate);
+        }
+        public void Dispose() { }
+    }
+
+    private sealed class RemoteSignalLease(SemaphoreSlim gate) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            gate.Release();
+            return ValueTask.CompletedTask;
+        }
     }
 }

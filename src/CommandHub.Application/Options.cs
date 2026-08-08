@@ -12,6 +12,7 @@ public sealed class ExecutionOptions
     public long MaximumOutputBytes { get; set; } = 10 * 1024 * 1024;
     public int OutputChunkBytes { get; set; } = 16 * 1024;
     public int ConnectionTimeoutSeconds { get; set; } = 15;
+    public bool RecoverOnStartup { get; set; } = true;
 }
 
 public sealed class SecurityOptions

@@ -4,6 +4,21 @@ namespace CommandHub.Domain;
 
 public static class DomainRules
 {
+    public const int MaximumCommandCharacters = 65_536;
+    public const int NormalizedCommandPrefixCharacters = 512;
+
+    public static void ValidateCommandLength(string command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        if (command.Length > MaximumCommandCharacters)
+            throw new DomainValidationException($"命令长度不能超过 {MaximumCommandCharacters} 个字符。");
+    }
+
+    public static string ComputeCommandHash(string normalizedCommand)
+    {
+        ArgumentNullException.ThrowIfNull(normalizedCommand);
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(normalizedCommand))).ToLowerInvariant();
+    }
     public static string NormalizeCommand(string command)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(command);

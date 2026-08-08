@@ -1,5 +1,5 @@
 <span class="status-badge status-@Status.ToString().ToLowerInvariant()">@Label</span>
 @code {
     [Parameter] public ExecutionStatus Status { get; set; }
-    private string Label => Status switch { ExecutionStatus.Succeeded => "成功", ExecutionStatus.Failed => "失败", ExecutionStatus.Running => "运行中", ExecutionStatus.Queued => "队列中", ExecutionStatus.Pending => "待处理", ExecutionStatus.Cancelled => "已取消", ExecutionStatus.TimedOut => "已超时", ExecutionStatus.Rejected => "已拒绝", ExecutionStatus.ConnectionFailed => "连接失败", _ => Status.ToString() };
+    private string Label => Status switch { ExecutionStatus.Succeeded => "成功", ExecutionStatus.Failed => "失败", ExecutionStatus.Running => "运行中", ExecutionStatus.Queued => "队列中", ExecutionStatus.Pending => "待处理", ExecutionStatus.Cancelled => "已取消", ExecutionStatus.TimedOut => "已超时", ExecutionStatus.Rejected => "已拒绝", ExecutionStatus.ConnectionFailed => "连接失败", ExecutionStatus.Interrupted => "已中断", _ => Status.ToString() };
 }
