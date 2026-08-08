@@ -41,6 +41,7 @@ public sealed class CommandHubFactory : WebApplicationFactory<Program>
         configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["Database:InitializeOnStartup"] = "false",
+            ["Execution:RecoverOnStartup"] = "false",
             ["ConnectionStrings:DefaultConnection"] = "Host=localhost;Database=unused;Username=unused;Password=unused",
             ["DataProtection:KeysPath"] = Path.Combine(Path.GetTempPath(), "commandhub-web-tests-keys"),
         });

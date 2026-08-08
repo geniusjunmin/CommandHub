@@ -42,13 +42,32 @@ jobs:
       - run: dotnet restore
       - run: dotnet format --verify-no-changes --no-restore
       - run: dotnet build --configuration Release --no-restore
-      - run: dotnet test --configuration Release --no-build --logger trx --results-directory TestResults --collect:"XPlat Code Coverage"
+      - run: dotnet test --configuration Release --no-build --logger trx --results-directory TestResults --collect:"XPlat Code Coverage" --settings tests/coverage.runsettings
         env:
           COMMANDHUB_TEST_POSTGRES: Host=localhost;Port=5432;Database=commandhub_test;Username=commandhub;Password=CI-${{ github.run_id }}-Aa1!
           COMMANDHUB_TEST_SSH_PASSWORD: CI-${{ github.run_id }}-Aa1!
+      - name: Enforce core coverage thresholds
+        run: ./scripts/check-coverage.sh TestResults
       - run: dotnet list package --vulnerable --include-transitive
       - run: POSTGRES_PASSWORD=compose-validation COMMANDHUB_ADMIN_EMAIL=admin@example.invalid COMMANDHUB_ADMIN_PASSWORD=compose-validation SSH_FIXTURE_PASSWORD=fixture-validation docker compose config
       - run: docker build --tag commandhub:ci .
+      - name: Start and health-check the Compose stack
+        env:
+          POSTGRES_PASSWORD: CI-compose-${{ github.run_id }}-Aa1!
+          COMMANDHUB_ADMIN_EMAIL: admin@example.invalid
+          COMMANDHUB_ADMIN_PASSWORD: CI-admin-${{ github.run_id }}-Aa1!
+          SSH_FIXTURE_PASSWORD: CI-ssh-${{ github.run_id }}-Aa1!
+        run: |
+          set -Eeuo pipefail
+          cleanup() {
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml logs --no-color || true
+            docker compose -f docker-compose.yml -f docker-compose.ci.yml down --volumes
+          }
+          trap cleanup EXIT
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml ps
+          curl --fail --insecure --retry 20 --retry-delay 3 --retry-all-errors https://localhost/health/live
+          curl --fail --insecure --retry 20 --retry-delay 3 --retry-all-errors https://localhost/health/ready
       - uses: actions/upload-artifact@v4
         if: always()
         with:
